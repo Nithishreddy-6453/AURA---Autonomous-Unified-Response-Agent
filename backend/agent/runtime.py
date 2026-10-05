@@ -8,7 +8,7 @@ from backend.models.action import Action, ActionStatus
 from backend.models.observation import Observation
 from backend.models.plan import Plan
 from backend.models.task import Task, TaskStatus
-from backend.tools.registry import ToolRegistry
+from backend.tools import ToolRegistry, get_default_tool_registry
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +34,7 @@ class AgentRuntime:
         on_state_change: Optional[Callable[[AgentState, Task], None]] = None,
     ) -> None:
         self.llm = llm_provider
-        self.tool_registry = tool_registry or ToolRegistry()
+        self.tool_registry = tool_registry or get_default_tool_registry()
         self.planner = planner or Planner(
             llm_provider=self.llm,
             tool_registry=self.tool_registry,

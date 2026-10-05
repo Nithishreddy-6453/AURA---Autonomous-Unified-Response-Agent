@@ -1,0 +1,9 @@
+TICKET_ID: REQ-2026-042
+CUSTOMER: Acme Corp
+CONTACT: Jane Doe (j.doe@acme.com)
+DATE: 2026-03-25
+SUBJECT: Request for SSO Integration Details
+STATUS: OPEN
+DESCRIPTION:
+Acme Corp security compliance team requires SAML 2.0 configuration guide
+and identity provider metadata for the staging portal.

@@ -1,0 +1,10 @@
+EMPLOYEE_ID: EMP-091
+NAME: Alex Chen
+ROLE: Senior Software Engineer
+START_DATE: 2026-04-01
+DEPARTMENT: Core Engineering
+STATUS: PENDING_HARDWARE
+CHECKLIST:
+  - Security Background Check: COMPLETE
+  - Laptop Provisioning: IN_PROGRESS
+  - GitHub & Cloud Access: PENDING
