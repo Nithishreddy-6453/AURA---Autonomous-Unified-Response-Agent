@@ -82,9 +82,17 @@ class BrowserTypeTool(Tool):
                     locator = page.get_by_placeholder(target, exact=False).first
                     strategy = f"placeholder='{target}'"
                 # 4. Try input[name=target] or input[id=target]
-                else:
+                elif await page.locator(f"input[name='{target}'], input[id='{target}'], textarea[name='{target}']").count() > 0:
                     locator = page.locator(f"input[name='{target}'], input[id='{target}'], textarea[name='{target}']").first
                     strategy = f"name_or_id='{target}'"
+                # 5. Try case-insensitive or partial attribute matching
+                else:
+                    normalized = target.lower().replace(" ", "_")
+                    locator = page.locator(
+                        f"input[name*='{normalized}'], input[id*='{normalized}'], "
+                        f"input[name*='{target}'], input[id*='{target}']"
+                    ).first
+                    strategy = f"partial_match='{target}'"
 
             if locator is None:
                 return Observation(

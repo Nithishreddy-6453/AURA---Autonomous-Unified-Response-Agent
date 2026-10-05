@@ -30,6 +30,27 @@ class PlanResponseSchema(BaseModel):
     )
 
 
+class NextActionResponseSchema(BaseModel):
+    """Structured output when deciding the next step dynamically from observations."""
+
+    is_complete: bool = Field(
+        default=False,
+        description="True if the task goal has been fully accomplished.",
+    )
+    completion_summary: Optional[str] = Field(
+        default=None,
+        description="Summary of task completion or final result.",
+    )
+    action: Optional[PlanActionSchema] = Field(
+        default=None,
+        description="Next tool action to execute if task is not yet complete.",
+    )
+    reasoning: Optional[str] = Field(
+        default=None,
+        description="Brief reasoning for choosing this action.",
+    )
+
+
 class PlanningResult(BaseModel):
     """Internal result wrapper for the planner's operation."""
 

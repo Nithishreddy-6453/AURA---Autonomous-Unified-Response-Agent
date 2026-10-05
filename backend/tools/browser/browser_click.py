@@ -29,6 +29,10 @@ class BrowserClickTool(Tool):
         return {
             "type": "object",
             "properties": {
+                "target": {
+                    "type": "string",
+                    "description": "Button text, label, or selector to click (e.g. 'View Invoices', 'Save Invoice', '+ New Invoice', '#submit-invoice-button').",
+                },
                 "text": {
                     "type": "string",
                     "description": "Visible text or button label to click (e.g. 'View Invoices', 'Save Invoice', '+ New Invoice').",
@@ -49,12 +53,20 @@ class BrowserClickTool(Tool):
         text = kwargs.get("text")
         role = kwargs.get("role")
         selector = kwargs.get("selector")
+        target = kwargs.get("target")
+
+        # Map target to selector if starts with # or ., else text
+        if target and not text and not selector:
+            if target.startswith("#") or target.startswith(".") or target.startswith("["):
+                selector = target
+            else:
+                text = target
 
         if not text and not selector and not role:
             return Observation(
                 action_id=action_id,
                 success=False,
-                error="Must specify at least 'text', 'role', or 'selector' to click.",
+                error="Must specify at least 'target', 'text', 'role', or 'selector' to click.",
             )
 
         try:
@@ -87,8 +99,21 @@ class BrowserClickTool(Tool):
                     error="Unable to construct locator strategy.",
                 )
 
-            # Wait for element to be visible and click
-            await locator.wait_for(state="visible", timeout=7000)
+            # Wait for element to be visible and click; fallback to selector if text fails
+            try:
+                await locator.wait_for(state="visible", timeout=7000)
+            except Exception:
+                if text and not selector:
+                    # Try finding button or link containing text
+                    fallback = page.locator(f"button:has-text('{text}'), a:has-text('{text}')").first
+                    if await fallback.count() > 0:
+                        locator = fallback
+                        await locator.wait_for(state="visible", timeout=5000)
+                    else:
+                        raise
+                else:
+                    raise
+
             await locator.click()
 
             # Brief pause for DOM/navigation updates
