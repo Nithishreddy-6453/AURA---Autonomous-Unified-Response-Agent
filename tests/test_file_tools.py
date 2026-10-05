@@ -105,8 +105,8 @@ class TestFileTools(unittest.TestCase):
         self.assertIn("Access denied", obs.error)
 
     def test_tool_registration_in_default_registry(self):
-        """Test that all three tools are registered in default registry with specifications."""
-        registry = get_default_tool_registry()
+        """Test that file tools are registered in default registry with specifications."""
+        registry = get_default_tool_registry(include_browser=False)
         self.assertTrue(registry.has("search_company_files"))
         self.assertTrue(registry.has("read_company_file"))
         self.assertTrue(registry.has("document_extract"))
