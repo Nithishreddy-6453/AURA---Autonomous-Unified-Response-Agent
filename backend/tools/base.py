@@ -42,6 +42,17 @@ class Tool(ABC):
         """JSON Schema dictionary describing the accepted arguments."""
         pass
 
+    @property
+    def risk_level(self) -> "ActionRisk":
+        """Base risk classification of the tool (defaults to READ)."""
+        from backend.policy.risk import ActionRisk
+        return ActionRisk.READ
+
+    @property
+    def capabilities(self) -> list[str]:
+        """Declared functional capabilities provided by this tool."""
+        return []
+
     @abstractmethod
     async def execute(self, **kwargs: Any) -> Observation:
         """Execute the tool action and return an Observation."""

@@ -46,28 +46,30 @@ NEXT_ACTION_SYSTEM_PROMPT = """You are AURA Step Reasoner, an autonomous task ex
 Given the User Goal, the Available Tools, and the History of executed Actions and their Observations, determine the single NEXT action to perform.
 
 STRICT RULES:
-1. You may ONLY choose tool names from the Available Tools list.
-2. If the goal has been fully accomplished (e.g., the invoice was saved/submitted in the portal and verified), set "is_complete": true, provide "completion_summary", and set "action": null.
-3. If the goal is not yet complete, specify the exact next "action" with "tool_name" and "arguments" adhering to the tool schema.
-4. Ground your arguments in the actual observations returned from prior steps:
+1. You may ONLY choose tool names from the Available Tools list. Never invent or hallucinate tool names.
+2. If the goal has been fully accomplished, set "is_complete": true, provide "completion_summary", and set "action": null.
+3. If human intervention is required (e.g. clarification needed, missing credentials, approval required), set "needs_human": true, explain in "reasoning", and set "action": null.
+4. If the goal is not yet complete, specify the exact next "action" with "tool_name" and "arguments" adhering to the tool schema.
+5. Ground your arguments in the actual observations returned from prior steps:
    - When choosing which invoice file is latest, compare dates and filenames returned in observations.
    - Use the exact extracted invoice ID, date, amount, due date from read_company_file or document_extract observations.
    - For browser navigation, use the allowed portal URL (e.g. 'http://localhost:3000/finance/invoices/new').
    - For browser typing, use valid targets like 'invoice_id', 'company', 'amount', 'due_date', 'invoice_date', etc.
    - For submitting, click the submit button (e.g. text='Save Invoice' or selector='#submit-invoice-button').
    - Take a screenshot as evidence before marking completion.
-5. Do NOT repeat failed or identical actions without changing arguments.
-6. Output MUST be strictly valid JSON conforming to the schema:
+6. Do NOT repeat failed or identical actions without changing arguments. If a previous action failed with an error, perform the corrective action (such as typing the missing required field or correcting the format).
+7. Output MUST be strictly valid JSON conforming to the schema:
 {
   "is_complete": true|false,
+  "needs_human": true|false,
   "completion_summary": null | "<summary if complete>",
-  "reasoning": "<brief explanation of what to do next based on prior observations>",
+  "reasoning": "<brief operational reasoning for choosing this action based on prior observations>",
   "action": {
     "tool_name": "<tool from available tools>",
     "arguments": { <arguments matching tool schema> }
   }
 }
-7. Do not include markdown codeblocks or any extra commentary. Output raw JSON only.
+8. Do not include markdown codeblocks or any extra commentary. Output raw JSON only.
 """
 
 
@@ -173,12 +175,17 @@ class Planner:
         task: Task,
         action_history: List[Action],
         observations: List[Observation],
+        recovery_context: Optional[str] = None,
+        max_recent_history: int = 5,
     ) -> NextActionResponseSchema:
-        """Determines the next step dynamically given previous observations."""
+        """Determines the next step dynamically given bounded previous observations and recovery context."""
         tool_specs = self.tool_registry.get_tool_specs()
 
+        # Bounded recent history
+        recent_pairs = list(zip(action_history, observations))[-max_recent_history:]
         history_summary = []
-        for i, (act, obs) in enumerate(zip(action_history, observations), start=1):
+        start_step = len(action_history) - len(recent_pairs) + 1
+        for i, (act, obs) in enumerate(recent_pairs, start=start_step):
             history_summary.append({
                 "step": i,
                 "tool": act.tool_name,
@@ -188,11 +195,32 @@ class Planner:
                 "error": obs.error if not obs.success else None,
             })
 
+        latest_obs = observations[-1] if observations else None
+        latest_obs_summary = {
+            "success": latest_obs.success,
+            "result": latest_obs.result if latest_obs.success else None,
+            "error": latest_obs.error if not latest_obs.success else None,
+        } if latest_obs else None
+
+        recovery_section = f"\nRecovery & Error Guidance:\n{recovery_context}\n" if recovery_context else ""
+
+        duplicate_warning = ""
+        if action_history and observations and not observations[-1].success:
+            last_act = action_history[-1]
+            duplicate_warning = (
+                f"\nWARNING: Step {len(action_history)} '{last_act.tool_name}' failed. "
+                f"Do NOT repeat the exact same tool and arguments without correcting the cause."
+            )
+
         user_content = (
-            f"User Goal: {task.user_goal}\n\n"
+            f"User Goal: {task.user_goal}\n"
+            f"Current Task Status: {task.status.value}\n\n"
             f"Available Tools:\n{json.dumps(tool_specs, indent=2)}\n\n"
             f"Execution History & Observations:\n{json.dumps(history_summary, indent=2)}\n\n"
-            f"Provide the NEXT action or declare completion."
+            f"Latest Observation:\n{json.dumps(latest_obs_summary, indent=2)}\n"
+            f"{recovery_section}"
+            f"{duplicate_warning}\n\n"
+            f"Provide the NEXT action, request human intervention, or declare completion as raw JSON."
         )
 
         try:
@@ -215,12 +243,24 @@ class Planner:
             )
 
         try:
-            return NextActionResponseSchema.model_validate(parsed_data)
+            decision = NextActionResponseSchema.model_validate(parsed_data)
         except Exception as e:
             return NextActionResponseSchema(
                 is_complete=False,
                 reasoning=f"Schema validation error: {str(e)}",
             )
+
+        # Validate that proposed tool is registered in ToolRegistry
+        if decision.action:
+            if not self.tool_registry.has(decision.action.tool_name):
+                logger.warning(f"Planner proposed unregistered tool '{decision.action.tool_name}'")
+                return NextActionResponseSchema(
+                    is_complete=False,
+                    action=None,
+                    reasoning=f"Tool '{decision.action.tool_name}' is not registered in ToolRegistry.",
+                )
+
+        return decision
 
     def _parse_json(self, text: str) -> Optional[dict]:
         """Extract and parse JSON object from raw response text."""

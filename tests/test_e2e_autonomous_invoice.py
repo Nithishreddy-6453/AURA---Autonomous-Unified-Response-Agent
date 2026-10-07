@@ -63,7 +63,16 @@ class MockAutonomousLLMProvider(LLMProvider):
                     "arguments": {"target": "company", "text": "Acme Corp"}
                 }
             },
-            # Step 6: Type amount
+            # Step 6: Type invoice_date
+            {
+                "is_complete": False,
+                "reasoning": "Type Invoice Date into form.",
+                "action": {
+                    "tool_name": "browser_type",
+                    "arguments": {"target": "invoice_date", "text": "2026-03-20"}
+                }
+            },
+            # Step 7: Type amount
             {
                 "is_complete": False,
                 "reasoning": "Type Total Amount into form.",
@@ -72,7 +81,7 @@ class MockAutonomousLLMProvider(LLMProvider):
                     "arguments": {"target": "amount", "text": "18036.00"}
                 }
             },
-            # Step 7: Type due_date
+            # Step 8: Type due_date
             {
                 "is_complete": False,
                 "reasoning": "Type Due Date into form.",

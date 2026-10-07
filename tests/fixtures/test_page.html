@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>AURA Browser Layer Test Environment</title>
+</head>
+<body>
+  <h1>AURA Browser Automation Test Page</h1>
+  <p id="description">Controlled local test fixture for verifying Playwright browser tools.</p>
+
+  <div id="status-box">Initial State</div>
+
+  <form id="test-form" onsubmit="event.preventDefault();">
+    <label for="username">Username:</label>
+    <input id="username" name="username" type="text" placeholder="Enter username" />
+
+    <label for="event-date">Date:</label>
+    <input id="event-date" name="event_date" type="date" />
+
+    <button id="submit-btn" type="button" onclick="document.getElementById('status-box').innerText = 'Form Submitted';">
+      Submit Test
+    </button>
+  </form>
+
+  <button id="action-btn" type="button" onclick="document.getElementById('status-box').innerText = 'Action Button Clicked';">
+    Click Action
+  </button>
+
+  <a id="nav-link" href="#bottom">Anchor Link</a>
+  <div id="bottom">Bottom of page</div>
+</body>
+</html>

@@ -1,5 +1,5 @@
 import logging
-from typing import Callable, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from backend.agent.planner import Planner
 from backend.agent.state import AgentState
@@ -9,6 +9,12 @@ from backend.models.observation import Observation
 from backend.models.plan import Plan
 from backend.models.task import Task, TaskStatus
 from backend.tools import ToolRegistry, get_default_tool_registry
+from backend.recovery.recovery_manager import RecoveryManager
+from backend.verification.finance_verifier import FinanceInvoiceVerifier
+from backend.memory.base import MemoryStore
+from backend.memory.sqlite_store import SQLiteMemoryStore
+from backend.policy.decision import PolicyDecision
+from backend.policy.engine import ActionPolicy, DefaultActionPolicy
 
 logger = logging.getLogger(__name__)
 
@@ -25,10 +31,8 @@ class AgentRuntime:
     -> ADAPTING / VERIFYING
     -> COMPLETED / FAILED / WAITING_FOR_HUMAN
 
-    Supports observation-grounded dynamic reasoning: after each tool execution,
-    the observation is captured, saved in execution memory, and provided to the
-    planner to resolve dynamic parameters (such as extracted invoice numbers,
-    amounts, dates, and form submissions).
+    Supports observation-grounded dynamic reasoning, durable task state persistence,
+    and centralized pre-execution safety and permission policy enforcement.
     """
 
     def __init__(
@@ -36,6 +40,8 @@ class AgentRuntime:
         llm_provider: LLMProvider,
         tool_registry: Optional[ToolRegistry] = None,
         planner: Optional[Planner] = None,
+        memory_store: Optional[MemoryStore] = None,
+        policy: Optional[ActionPolicy] = None,
         on_state_change: Optional[Callable[[AgentState, Task], None]] = None,
         on_action: Optional[Callable[[Action], None]] = None,
         on_observation: Optional[Callable[[Action, Observation], None]] = None,
@@ -47,6 +53,8 @@ class AgentRuntime:
             llm_provider=self.llm,
             tool_registry=self.tool_registry,
         )
+        self.memory_store: MemoryStore = memory_store or SQLiteMemoryStore()
+        self.policy: ActionPolicy = policy or DefaultActionPolicy()
         self.state: AgentState = AgentState.RECEIVED
         self.on_state_change = on_state_change
         self.on_action = on_action
@@ -56,24 +64,40 @@ class AgentRuntime:
         self.current_plan: Optional[Plan] = None
         self.executed_actions: List[Action] = []
         self.observations: List[Observation] = []
+        self.recovery_manager = RecoveryManager()
+        self.finance_verifier = FinanceInvoiceVerifier()
 
-    def set_state(self, new_state: AgentState) -> None:
-        """Transitions the runtime state and triggers callback if configured."""
+    def set_state(self, new_state: AgentState, status: Optional[TaskStatus] = None) -> None:
+        """Transitions the runtime state, logs memory change, and updates MemoryStore."""
         logger.info(f"State transition: {self.state} -> {new_state}")
+        logger.info(f"[MEMORY] state -> {new_state.value}")
         self.state = new_state
+        if status is not None and self.current_task:
+            self.current_task.status = status
+        if self.current_task:
+            self.memory_store.update_task_state(
+                self.current_task.task_id,
+                new_state,
+                status=self.current_task.status,
+                metadata=self.current_task.metadata,
+            )
         if self.on_state_change and self.current_task:
             self.on_state_change(new_state, self.current_task)
 
     async def execute_task(self, task: Task, use_dynamic_adaptation: bool = True) -> Task:
-        """Runs the orchestrator through the task lifecycle."""
+        """Runs the orchestrator through the adaptive task lifecycle with memory persistence."""
         self.current_task = task
         self.observations.clear()
         self.executed_actions.clear()
+
+        # Persist task creation
+        self.memory_store.create_task(task, initial_state=AgentState.RECEIVED)
+        logger.info(f"[TASK] created {task.task_id}")
         self.set_state(AgentState.RECEIVED)
 
         # 1. Understanding phase
-        self.set_state(AgentState.UNDERSTANDING)
         task.status = TaskStatus.RUNNING
+        self.set_state(AgentState.UNDERSTANDING, status=TaskStatus.RUNNING)
 
         # 2. Planning phase
         self.set_state(AgentState.PLANNING)
@@ -83,7 +107,7 @@ class AgentRuntime:
             logger.warning(f"Planning failed: {planning_result.error}")
             task.status = TaskStatus.FAILED
             task.metadata["error"] = planning_result.error
-            self.set_state(AgentState.FAILED)
+            self.set_state(AgentState.FAILED, status=TaskStatus.FAILED)
             return task
 
         # Build initial Plan object
@@ -96,70 +120,441 @@ class AgentRuntime:
                 for a in planning_result.actions
             ],
         )
+        self.memory_store.save_plan(task.task_id, self.current_plan)
 
         if not self.current_plan.actions:
             logger.info("Empty plan returned; marking as completed.")
-            task.status = TaskStatus.COMPLETED
-            self.set_state(AgentState.COMPLETED)
+            self.set_state(AgentState.COMPLETED, status=TaskStatus.COMPLETED)
             return task
 
         # 3. Execution & Observation Loop
         if not use_dynamic_adaptation:
             # Static execution mode
             for action in self.current_plan.actions:
-                success = await self._execute_single_action(action, task)
-                if not success:
+                obs = await self._execute_single_action(action, task)
+                if not obs.success:
+                    self.set_state(AgentState.ADAPTING)
+                    task.status = TaskStatus.FAILED
+                    task.metadata["error"] = obs.error
+                    self.set_state(AgentState.FAILED, status=TaskStatus.FAILED)
                     return task
+            self.set_state(AgentState.VERIFYING)
+            self.set_state(AgentState.COMPLETED, status=TaskStatus.COMPLETED)
+            return task
         else:
-            # Dynamic adaptation mode: Start with the first discovery action from plan,
-            # then ground every subsequent action in the actual observations returned.
+            # Dynamic adaptive execution mode
             initial_actions = self.current_plan.actions[:1] if self.current_plan.actions else []
+            recovery_context: Optional[str] = None
+            steps_taken = 0
+
+            # Execute first discovery action from plan if present
             for action in initial_actions:
-                success = await self._execute_single_action(action, task)
-                if not success:
+                tool = self.tool_registry.get(action.tool_name) if self.tool_registry.has(action.tool_name) else None
+                decision = self.policy.evaluate(task, action, tool)
+                outcome_str = "ALLOWED" if decision.allowed else ("REQUIRES_HUMAN" if decision.requires_human else "BLOCKED")
+                logger.info(f"[POLICY] {action.tool_name} → {decision.risk_level.value} → {outcome_str}")
+                self.memory_store.append_policy_event(task.task_id, decision.to_dict())
+
+                if decision.requires_human:
+                    logger.info(f"[WAITING_FOR_HUMAN] {decision.reason}")
+                    task.metadata["pending_action"] = action.model_dump()
+                    task.metadata["human_intervention_reason"] = decision.reason
+                    self.set_state(AgentState.WAITING_FOR_HUMAN, status=TaskStatus.WAITING_FOR_HUMAN)
                     return task
 
-            steps_taken = len(initial_actions)
-            while steps_taken < self.max_dynamic_steps:
-                next_decision = await self.planner.decide_next_action(
-                    task=task,
-                    action_history=self.executed_actions,
-                    observations=self.observations,
-                )
-
-                if next_decision.is_complete:
-                    logger.info(f"Task completed: {next_decision.completion_summary}")
-                    task.metadata["completion_summary"] = next_decision.completion_summary
+                if decision.blocked:
+                    logger.warning(f"[BLOCKED] Action '{action.tool_name}' blocked by policy: {decision.reason}")
+                    action.status = ActionStatus.FAILED
+                    self.executed_actions.append(action)
+                    self.memory_store.append_action(task.task_id, action)
+                    obs = Observation(
+                        action_id=action.action_id,
+                        success=False,
+                        error=f"Action blocked by policy: {decision.reason}",
+                    )
+                    self.observations.append(obs)
+                    self.memory_store.append_observation(task.task_id, obs)
+                    steps_taken += 1
+                    recovery_context = f"Initial action '{action.tool_name}' blocked by safety policy: {decision.reason}."
                     break
 
-                if not next_decision.action:
-                    break
-
-                self.set_state(AgentState.ADAPTING)
-                next_action = Action(
-                    tool_name=next_decision.action.tool_name,
-                    arguments=next_decision.action.arguments,
-                )
-                self.current_plan.actions.append(next_action)
-
-                success = await self._execute_single_action(next_action, task)
-                if not success:
-                    return task
-
+                logger.info(f"[PLAN] Initial action: {action.tool_name} {action.arguments}")
+                obs = await self._execute_single_action(action, task)
                 steps_taken += 1
+                if not obs.success:
+                    policy = self.recovery_manager.handle_failure(task, obs.error or "", action.tool_name)
+                    self.memory_store.append_recovery_event(task.task_id, {
+                        "source": action.tool_name,
+                        "policy": policy,
+                        "error": obs.error,
+                    })
+                    logger.info(f"[MEMORY] recovery event persisted")
+                    logger.warning(f"[RECOVERY] Failure on initial action. Policy: {policy}")
+                    if policy == "ESCALATE":
+                        self.set_state(AgentState.ADAPTING)
+                        task.status = TaskStatus.FAILED
+                        task.metadata["error"] = obs.error
+                        self.set_state(AgentState.FAILED, status=TaskStatus.FAILED)
+                        return task
+                    else:
+                        recovery_context = f"Initial action '{action.tool_name}' failed: {obs.error}. Policy: {policy}."
+
+            return await self._run_adaptive_loop(task, recovery_context=recovery_context, steps_taken=steps_taken)
+
+    def approve_task(self, task_id: str, feedback: Optional[str] = None) -> Task:
+        """Approves a pending action on a task in WAITING_FOR_HUMAN or NEEDS_HUMAN state."""
+        record = self.memory_store.get_task(task_id)
+        if not record:
+            raise KeyError(f"Task '{task_id}' not found in memory store.")
+
+        task = record.task
+        logger.info(f"[APPROVAL] Task {task_id} approved by human operator.")
+        task.metadata["approval_status"] = "APPROVED"
+        pending_act = task.metadata.get("pending_action")
+        if pending_act:
+            task.metadata["approved_action_id"] = pending_act.get("action_id")
+            task.metadata["approved_tool_name"] = pending_act.get("tool_name")
+        if feedback:
+            task.metadata["approval_feedback"] = feedback
+        task.status = TaskStatus.RUNNING
+
+        approval_event = {
+            "type": "HUMAN_APPROVAL",
+            "task_id": task_id,
+            "status": "APPROVED",
+            "pending_action": pending_act,
+            "feedback": feedback,
+        }
+        self.memory_store.append_policy_event(task_id, approval_event)
+        self.memory_store.update_task_state(
+            task_id,
+            state=AgentState.ADAPTING,
+            status=TaskStatus.RUNNING,
+            metadata=task.metadata,
+        )
+        return task
+
+    async def resume_task(self, task_id: str) -> Task:
+        """Resumes a previously persisted task from its stored state in MemoryStore."""
+        record = self.memory_store.get_task(task_id)
+        if not record:
+            raise KeyError(f"Task '{task_id}' not found in memory store.")
+
+        logger.info(f"[RESUME] loading task {task_id}")
+        task = record.task
+        self.current_task = task
+        self.state = record.state
+        self.current_plan = record.plan
+        self.executed_actions = list(record.actions)
+        self.observations = list(record.observations)
+
+        is_approved = task.metadata.get("approval_status") == "APPROVED"
+
+        # Terminal tasks must not restart automatically unless approved
+        terminal_statuses = (
+            TaskStatus.COMPLETED,
+            TaskStatus.FAILED,
+            TaskStatus.WAITING_FOR_HUMAN,
+            TaskStatus.NEEDS_HUMAN,
+        )
+        terminal_states = (
+            AgentState.COMPLETED,
+            AgentState.FAILED,
+            AgentState.WAITING_FOR_HUMAN,
+            AgentState.NEEDS_HUMAN,
+        )
+        if (task.status in terminal_statuses or record.state in terminal_states) and not is_approved:
+            logger.info(
+                f"[RESUME] Task {task_id} is in terminal status {task.status} / state {record.state}. Returning existing record."
+            )
+            return task
+
+        # Non-terminal or approved: transition to ADAPTING and resume execution loop from stored history
+        logger.info(
+            f"[RESUME] Resuming task {task_id} from {len(self.executed_actions)} stored actions."
+        )
+        task.status = TaskStatus.RUNNING
+        self.set_state(AgentState.ADAPTING, status=TaskStatus.RUNNING)
+
+        # If there is an approved pending action, execute it first
+        if task.metadata.get("pending_action") and is_approved:
+            pending_action_dict = task.metadata.pop("pending_action")
+            pending_action = Action.model_validate(pending_action_dict)
+            logger.info(
+                f"[RESUME] Executing approved pending action '{pending_action.tool_name}'"
+            )
+            obs = await self._execute_single_action(pending_action, task)
+            recovery_context = None
+            if not obs.success:
+                policy = self.recovery_manager.handle_failure(task, obs.error or "", pending_action.tool_name)
+                recovery_context = f"Approved action '{pending_action.tool_name}' failed: {obs.error}. Policy: {policy}."
+
+            return await self._run_adaptive_loop(
+                task, recovery_context=recovery_context, steps_taken=len(self.executed_actions)
+            )
+
+        recovery_context = None
+        if self.observations and not self.observations[-1].success:
+            last_err = self.observations[-1].error or "Previous step failed"
+            recovery_context = f"Resumed after failure on previous action: {last_err}."
+
+        return await self._run_adaptive_loop(
+            task, recovery_context=recovery_context, steps_taken=len(self.executed_actions)
+        )
+
+    async def _run_adaptive_loop(
+        self,
+        task: Task,
+        recovery_context: Optional[str] = None,
+        steps_taken: int = 0,
+    ) -> Task:
+        """Core adaptive execution loop driven by observations and bounded short-term memory."""
+        while steps_taken < self.max_dynamic_steps:
+            next_decision = await self.planner.decide_next_action(
+                task=task,
+                action_history=self.executed_actions,
+                observations=self.observations,
+                recovery_context=recovery_context,
+            )
+
+            # Check if human intervention requested
+            if next_decision.needs_human:
+                logger.info(f"[NEEDS_HUMAN] {next_decision.reasoning}")
+                self.set_state(AgentState.ADAPTING)
+                task.status = TaskStatus.NEEDS_HUMAN
+                task.metadata["human_intervention_reason"] = next_decision.reasoning
+                self.set_state(AgentState.NEEDS_HUMAN, status=TaskStatus.NEEDS_HUMAN)
+                return task
+
+            # Check if task completion proposed by planner
+            if next_decision.is_complete:
+                logger.info(f"[PLAN] Completion proposed: {next_decision.completion_summary}")
+                task.metadata["completion_summary"] = next_decision.completion_summary
+
+                self.set_state(AgentState.VERIFYING)
+                extracted_data = self._extract_data_from_actions()
+
+                if extracted_data.get("invoice_id"):
+                    verification_result = await self.finance_verifier.verify(task.metadata, extracted_data)
+                    if not verification_result.is_verified:
+                        logger.warning(f"[VERIFY] Verification failed: {verification_result.details}")
+                        policy = self.recovery_manager.handle_failure(task, verification_result.details, "finance_verifier")
+                        self.memory_store.append_recovery_event(task.task_id, {
+                            "source": "finance_verifier",
+                            "policy": policy,
+                            "details": verification_result.details,
+                        })
+                        logger.info(f"[MEMORY] recovery event persisted")
+                        if policy == "ESCALATE":
+                            self.set_state(AgentState.ADAPTING)
+                            task.status = TaskStatus.NEEDS_HUMAN
+                            task.metadata["error"] = verification_result.details
+                            self.set_state(AgentState.NEEDS_HUMAN, status=TaskStatus.NEEDS_HUMAN)
+                            return task
+                        elif policy == "CORRECT_DATA":
+                            logger.info("[ADAPT] Recovering from verification failure by correcting data...")
+                            self.set_state(AgentState.ADAPTING)
+                            obs = Observation(
+                                action_id="verifier",
+                                success=False,
+                                error=f"Verification failed: {verification_result.details}. Please correct the data before saving again.",
+                            )
+                            self.observations.append(obs)
+                            self.memory_store.append_observation(task.task_id, obs)
+                            logger.info(f"[MEMORY] observation persisted")
+                            recovery_context = f"Verification failed: {verification_result.details}. Policy: CORRECT_DATA."
+                            steps_taken += 1
+                            continue
+
+                logger.info("[COMPLETE] Task successfully verified and completed.")
+                self.set_state(AgentState.COMPLETED, status=TaskStatus.COMPLETED)
+                return task
+
+            # If no action is proposed and not explicitly complete, exit loop
+            if not next_decision.action:
+                break
+
+            # Prepare next action
+            next_action = Action(
+                tool_name=next_decision.action.tool_name,
+                arguments=next_decision.action.arguments,
+            )
+            if self.current_plan:
+                self.current_plan.actions.append(next_action)
+                self.memory_store.save_plan(task.task_id, self.current_plan)
+
+            # Duplicate Action Loop Protection
+            if len(self.executed_actions) >= 1 and self.observations and not self.observations[-1].success:
+                last_act = self.executed_actions[-1]
+                if (
+                    next_action.tool_name == last_act.tool_name
+                    and next_action.arguments == last_act.arguments
+                ):
+                    next_action.retry_count = last_act.retry_count + 1
+                    logger.warning(
+                        f"[DUPLICATE BLOCKED] Repeating failed action '{next_action.tool_name}' "
+                        f"(attempt {next_action.retry_count + 1})."
+                    )
+                    if next_action.retry_count >= 2:
+                        logger.error("[ESCALATE] Duplicate action loop detected. Escalating.")
+                        self.set_state(AgentState.ADAPTING)
+                        task.status = TaskStatus.FAILED
+                        task.metadata["error"] = f"Loop detected: Repeated failed action '{next_action.tool_name}' without adaptation."
+                        self.set_state(AgentState.FAILED, status=TaskStatus.FAILED)
+                        return task
+
+            # Policy evaluation
+            tool = self.tool_registry.get(next_action.tool_name) if self.tool_registry.has(next_action.tool_name) else None
+            decision = self.policy.evaluate(task, next_action, tool)
+            outcome_str = "ALLOWED" if decision.allowed else ("REQUIRES_HUMAN" if decision.requires_human else "BLOCKED")
+            logger.info(f"[POLICY] {next_action.tool_name} → {decision.risk_level.value} → {outcome_str}")
+            self.memory_store.append_policy_event(task.task_id, decision.to_dict())
+
+            if decision.requires_human:
+                logger.info(f"[WAITING_FOR_HUMAN] {decision.reason}")
+                task.metadata["pending_action"] = next_action.model_dump()
+                task.metadata["human_intervention_reason"] = decision.reason
+                self.set_state(AgentState.WAITING_FOR_HUMAN, status=TaskStatus.WAITING_FOR_HUMAN)
+                return task
+
+            if decision.blocked:
+                logger.warning(f"[BLOCKED] Action '{next_action.tool_name}' blocked by policy: {decision.reason}")
+                next_action.status = ActionStatus.FAILED
+                self.executed_actions.append(next_action)
+                self.memory_store.append_action(task.task_id, next_action)
+                obs = Observation(
+                    action_id=next_action.action_id,
+                    success=False,
+                    error=f"Action blocked by policy: {decision.reason}",
+                )
+                self.observations.append(obs)
+                self.memory_store.append_observation(task.task_id, obs)
+                steps_taken += 1
+                recovery_context = f"Action '{next_action.tool_name}' blocked by safety policy: {decision.reason}. Please select an alternative action."
+                continue
+
+            logger.info(f"[PLAN] {next_action.tool_name} {next_action.arguments}")
+            if next_decision.reasoning:
+                logger.info(f"[ADAPT] Reason: {next_decision.reasoning}")
+
+            self.set_state(AgentState.ADAPTING)
+            obs = await self._execute_single_action(next_action, task)
+            steps_taken += 1
+
+            if not obs.success:
+                policy = self.recovery_manager.handle_failure(task, obs.error or "", next_action.tool_name)
+                self.memory_store.append_recovery_event(task.task_id, {
+                    "source": next_action.tool_name,
+                    "policy": policy,
+                    "error": obs.error,
+                })
+                logger.info(f"[MEMORY] recovery event persisted")
+                logger.info(f"[RECOVERY] Failure classified for '{next_action.tool_name}'. Policy: {policy}")
+                if policy == "ESCALATE":
+                    logger.warning(f"[ESCALATE] Unrecoverable failure or retry budget exceeded: {obs.error}")
+                    self.set_state(AgentState.ADAPTING)
+                    task.status = TaskStatus.FAILED
+                    task.metadata["error"] = obs.error
+                    self.set_state(AgentState.FAILED, status=TaskStatus.FAILED)
+                    return task
+                else:
+                    recovery_context = (
+                        f"Action '{next_action.tool_name}' failed: '{obs.error}'. "
+                        f"Recovery policy: {policy}. Choose a corrective action."
+                    )
+            else:
+                recovery_context = None
+
+        # Check if step budget was exhausted
+        if steps_taken >= self.max_dynamic_steps:
+            logger.error(f"[BUDGET EXHAUSTED] Maximum step budget ({self.max_dynamic_steps}) reached.")
+            self.set_state(AgentState.ADAPTING)
+            task.status = TaskStatus.FAILED
+            task.metadata["error"] = f"Execution step budget of {self.max_dynamic_steps} steps exhausted."
+            self.set_state(AgentState.FAILED, status=TaskStatus.FAILED)
+            return task
 
         # 4. Verifying / Completion
         self.set_state(AgentState.VERIFYING)
-        task.status = TaskStatus.COMPLETED
-        self.set_state(AgentState.COMPLETED)
+        self.set_state(AgentState.COMPLETED, status=TaskStatus.COMPLETED)
         return task
 
-    async def _execute_single_action(self, action: Action, task: Task) -> bool:
+    def _extract_data_from_actions(self) -> Dict[str, Any]:
+        """Extracts field data from recent browser actions for independent verification."""
+        extracted = {}
+        for action in self.executed_actions:
+            if action.tool_name == "browser_type":
+                args = action.arguments
+                selector = args.get("selector", "") or args.get("target", "")
+                text = args.get("text", "")
+                if "invoice_date" in selector:
+                    extracted["invoice_date"] = text
+                if "due_date" in selector:
+                    extracted["due_date"] = text
+                if "amount" in selector:
+                    extracted["amount"] = text
+                if "company" in selector:
+                    extracted["company"] = text
+                if "invoice_id" in selector:
+                    extracted["invoice_id"] = text
+        return extracted
+
+    async def _execute_single_action(self, action: Action, task: Task) -> Observation:
         """Executes a single action, records observation, and manages state transitions."""
+        logger.info(f"[EXECUTE] {action.tool_name}")
         self.set_state(AgentState.EXECUTING)
         action.status = ActionStatus.RUNNING
         if self.on_action:
             self.on_action(action)
+
+        self.memory_store.append_action(task.task_id, action)
+        logger.info(f"[MEMORY] action persisted")
+
+        # Defense-in-depth: check policy as execution gate
+        tool = self.tool_registry.get(action.tool_name) if self.tool_registry.has(action.tool_name) else None
+        decision = self.policy.evaluate(task, action, tool)
+        if decision.blocked:
+            obs = Observation(
+                action_id=action.action_id,
+                success=False,
+                error=f"Action blocked by policy: {decision.reason}",
+            )
+            self.observations.append(obs)
+            self.executed_actions.append(action)
+            action.status = ActionStatus.FAILED
+            self.set_state(AgentState.OBSERVING)
+            if self.on_observation:
+                self.on_observation(action, obs)
+            self.memory_store.append_observation(task.task_id, obs)
+            logger.info(f"[MEMORY] observation persisted")
+            self.memory_store.append_action(task.task_id, action)
+            logger.warning(f"[OBSERVE] Action blocked by policy: {action.tool_name}")
+            return obs
+
+        is_approved = (
+            task.metadata.get("approval_status") == "APPROVED"
+            and (
+                task.metadata.get("approved_action_id") == action.action_id
+                or task.metadata.get("approved_tool_name") == action.tool_name
+            )
+        )
+        if decision.requires_human and not is_approved:
+            obs = Observation(
+                action_id=action.action_id,
+                success=False,
+                error=f"Action requires human approval: {decision.reason}",
+            )
+            self.observations.append(obs)
+            self.executed_actions.append(action)
+            action.status = ActionStatus.FAILED
+            self.set_state(AgentState.OBSERVING)
+            if self.on_observation:
+                self.on_observation(action, obs)
+            self.memory_store.append_observation(task.task_id, obs)
+            logger.info(f"[MEMORY] observation persisted")
+            self.memory_store.append_action(task.task_id, action)
+            logger.warning(f"[OBSERVE] Action requires human approval: {action.tool_name}")
+            return obs
 
         # Reject unknown tools safely before execution
         if not self.tool_registry.has(action.tool_name):
@@ -174,11 +569,11 @@ class AgentRuntime:
             self.set_state(AgentState.OBSERVING)
             if self.on_observation:
                 self.on_observation(action, obs)
-            self.set_state(AgentState.ADAPTING)
-            self.set_state(AgentState.FAILED)
-            task.status = TaskStatus.FAILED
-            task.metadata["error"] = obs.error
-            return False
+            self.memory_store.append_observation(task.task_id, obs)
+            logger.info(f"[MEMORY] observation persisted")
+            self.memory_store.append_action(task.task_id, action)
+            logger.warning(f"[OBSERVE] Tool not registered: {action.tool_name}")
+            return obs
 
         tool = self.tool_registry.get(action.tool_name)
 
@@ -197,13 +592,15 @@ class AgentRuntime:
         if self.on_observation:
             self.on_observation(action, observation)
 
+        self.memory_store.append_observation(task.task_id, observation)
+        logger.info(f"[MEMORY] observation persisted")
+
         if observation.success:
             action.status = ActionStatus.SUCCESS
-            return True
+            logger.info(f"[OBSERVE] Success: {action.tool_name}")
         else:
             action.status = ActionStatus.FAILED
-            self.set_state(AgentState.ADAPTING)
-            self.set_state(AgentState.FAILED)
-            task.status = TaskStatus.FAILED
-            task.metadata["error"] = observation.error
-            return False
+            logger.warning(f"[OBSERVE] Failure: {action.tool_name} -> {observation.error}")
+
+        self.memory_store.append_action(task.task_id, action)
+        return observation

@@ -26,21 +26,46 @@ class BrowserReadTool(Tool):
         return {
             "type": "object",
             "properties": {
+                "selector": {
+                    "type": "string",
+                    "description": "Optional CSS selector to read text from a specific element or container.",
+                },
                 "max_elements": {
                     "type": "integer",
                     "description": "Maximum number of interactive controls to summarize (default 30).",
-                }
+                },
             },
         }
 
     async def execute(self, **kwargs: Any) -> Observation:
         action_id = kwargs.get("action_id", "")
+        selector = kwargs.get("selector")
         max_elements = kwargs.get("max_elements", 30)
 
         try:
             page = await self.session.get_page()
             current_url = page.url
             title = await page.title()
+
+            if selector:
+                locator = page.locator(selector).first
+                if await locator.count() == 0:
+                    return Observation(
+                        action_id=action_id,
+                        success=False,
+                        error=f"Element matching selector '{selector}' not found on page.",
+                    )
+                text = (await locator.inner_text() or "").strip()
+                return Observation(
+                    action_id=action_id,
+                    success=True,
+                    result={
+                        "url": current_url,
+                        "title": title,
+                        "selector": selector,
+                        "visible_text_summary": text[:2000],
+                    },
+                )
 
             # Extract structured text and interactive elements via lightweight script evaluation
             extract_script = """

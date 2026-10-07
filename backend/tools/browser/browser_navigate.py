@@ -5,6 +5,9 @@ from backend.models.observation import Observation
 from backend.tools.base import Tool
 from backend.tools.browser.browser_session import BrowserSession
 
+from pathlib import Path
+import urllib.request
+
 # Permitted domains/hosts for browser navigation
 ALLOWED_HOSTS = {
     "localhost",
@@ -15,9 +18,15 @@ ALLOWED_PORTS = {3000}
 
 
 def is_url_allowed(url: str) -> bool:
-    """Security check: only permits navigation to explicitly allowed local origins."""
+    """Security check: only permits navigation to explicitly allowed local origins or workspace test files."""
     try:
         parsed = urlparse(url)
+        if parsed.scheme == "file":
+            raw_path = urllib.request.url2pathname(parsed.path)
+            # Normalize drive letter or unix path
+            file_path = Path(raw_path).resolve()
+            project_root = Path(__file__).resolve().parents[3]
+            return file_path.is_relative_to(project_root) and file_path.exists()
         if parsed.scheme not in ("http", "https"):
             return False
         hostname = parsed.hostname

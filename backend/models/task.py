@@ -11,6 +11,7 @@ class TaskStatus(str, Enum):
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
     WAITING_FOR_HUMAN = "WAITING_FOR_HUMAN"
+    NEEDS_HUMAN = "NEEDS_HUMAN"
 
 
 class Task(BaseModel):
@@ -20,4 +21,5 @@ class Task(BaseModel):
     user_goal: str
     status: TaskStatus = TaskStatus.PENDING
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     metadata: Dict[str, Any] = Field(default_factory=dict)

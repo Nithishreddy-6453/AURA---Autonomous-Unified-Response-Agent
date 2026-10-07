@@ -37,6 +37,10 @@ class NextActionResponseSchema(BaseModel):
         default=False,
         description="True if the task goal has been fully accomplished.",
     )
+    needs_human: bool = Field(
+        default=False,
+        description="True if human intervention or clarification is required to proceed.",
+    )
     completion_summary: Optional[str] = Field(
         default=None,
         description="Summary of task completion or final result.",

@@ -84,3 +84,10 @@ class BrowserSession:
     @property
     def is_active(self) -> bool:
         return self._page is not None and not self._page.is_closed()
+
+    async def __aenter__(self) -> "BrowserSession":
+        await self.get_page()
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
+        await self.close()

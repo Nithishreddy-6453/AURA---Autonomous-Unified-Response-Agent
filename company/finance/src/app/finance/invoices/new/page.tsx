@@ -11,7 +11,7 @@ export default function NewInvoicePage() {
   const [form, setForm] = useState({
     invoice_id: "",
     company: "",
-    invoice_date: new Date().toISOString().split("T")[0],
+    invoice_date: "",
     amount: "",
     currency: "USD",
     due_date: "",

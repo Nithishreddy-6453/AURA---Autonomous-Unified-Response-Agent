@@ -34,7 +34,7 @@ async def run_autonomous_workflow(user_goal: str):
     step_counter = 1
 
     def handle_state_change(new_state: AgentState, t: Task):
-        pass
+        print(f"\n--- STATE TRANSITION: {new_state.value} ---")
 
     def handle_action(action: Action):
         nonlocal step_counter

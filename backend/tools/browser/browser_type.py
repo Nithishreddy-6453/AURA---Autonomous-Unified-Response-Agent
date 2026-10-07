@@ -25,6 +25,15 @@ class BrowserTypeTool(Tool):
         )
 
     @property
+    def risk_level(self):
+        from backend.policy.risk import ActionRisk
+        return ActionRisk.WRITE
+
+    @property
+    def capabilities(self):
+        return ["browser", "write", "data_entry"]
+
+    @property
     def input_schema(self) -> Dict[str, Any]:
         return {
             "type": "object",
@@ -102,7 +111,23 @@ class BrowserTypeTool(Tool):
                 )
 
             await locator.wait_for(state="visible", timeout=7000)
-            await locator.fill(text)
+
+            # Check if target is an HTML date input for date-safe dispatch
+            is_date_input = False
+            try:
+                tag_type = await locator.get_attribute("type")
+                is_date_input = tag_type == "date"
+            except Exception:
+                pass
+
+            if is_date_input:
+                # Ensure exact ISO YYYY-MM-DD format is set directly and triggers input/change events
+                clean_date = text.strip()
+                await locator.fill(clean_date)
+                # Ensure change and input events dispatch cleanly for React controlled inputs
+                await locator.evaluate("(el, val) => { el.value = val; el.dispatchEvent(new Event('input', { bubbles: true })); el.dispatchEvent(new Event('change', { bubbles: true })); }", clean_date)
+            else:
+                await locator.fill(text)
 
             return Observation(
                 action_id=action_id,

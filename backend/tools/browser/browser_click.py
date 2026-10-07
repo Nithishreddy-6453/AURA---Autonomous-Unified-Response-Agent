@@ -25,6 +25,15 @@ class BrowserClickTool(Tool):
         )
 
     @property
+    def risk_level(self):
+        from backend.policy.risk import ActionRisk
+        return ActionRisk.WRITE
+
+    @property
+    def capabilities(self):
+        return ["browser", "write", "interaction"]
+
+    @property
     def input_schema(self) -> Dict[str, Any]:
         return {
             "type": "object",
