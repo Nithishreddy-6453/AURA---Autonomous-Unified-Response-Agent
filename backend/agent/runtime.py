@@ -1,9 +1,11 @@
 import logging
+from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
 
 from backend.agent.planner import Planner
 from backend.agent.state import AgentState
 from backend.llm.base import LLMProvider
+from backend.llm.router import get_llm_provider
 from backend.models.action import Action, ActionStatus
 from backend.models.observation import Observation
 from backend.models.plan import Plan
@@ -37,7 +39,7 @@ class AgentRuntime:
 
     def __init__(
         self,
-        llm_provider: LLMProvider,
+        llm_provider: Optional[LLMProvider] = None,
         tool_registry: Optional[ToolRegistry] = None,
         planner: Optional[Planner] = None,
         memory_store: Optional[MemoryStore] = None,
@@ -47,7 +49,7 @@ class AgentRuntime:
         on_observation: Optional[Callable[[Action, Observation], None]] = None,
         max_dynamic_steps: int = 15,
     ) -> None:
-        self.llm = llm_provider
+        self.llm = llm_provider or get_llm_provider()
         self.tool_registry = tool_registry or get_default_tool_registry()
         self.planner = planner or Planner(
             llm_provider=self.llm,
@@ -66,11 +68,30 @@ class AgentRuntime:
         self.observations: List[Observation] = []
         self.recovery_manager = RecoveryManager()
         self.finance_verifier = FinanceInvoiceVerifier()
+        self._events: List[Dict[str, Any]] = []
+
+    def _record_event(
+        self,
+        task_id: str,
+        event_type: str,
+        message: str,
+        details: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Records an operational lifecycle event without exposing private reasoning."""
+        event = {
+            "task_id": task_id,
+            "event_type": event_type,
+            "message": message,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "details": details or {},
+        }
+        self._events.append(event)
 
     def set_state(self, new_state: AgentState, status: Optional[TaskStatus] = None) -> None:
         """Transitions the runtime state, logs memory change, and updates MemoryStore."""
         logger.info(f"State transition: {self.state} -> {new_state}")
         logger.info(f"[MEMORY] state -> {new_state.value}")
+        old_state = self.state
         self.state = new_state
         if status is not None and self.current_task:
             self.current_task.status = status
@@ -80,6 +101,12 @@ class AgentRuntime:
                 new_state,
                 status=self.current_task.status,
                 metadata=self.current_task.metadata,
+            )
+            self._record_event(
+                self.current_task.task_id,
+                "STATE_CHANGE",
+                f"State changed to {new_state.value}",
+                {"from_state": old_state.value, "to_state": new_state.value},
             )
         if self.on_state_change and self.current_task:
             self.on_state_change(new_state, self.current_task)
@@ -93,6 +120,7 @@ class AgentRuntime:
         # Persist task creation
         self.memory_store.create_task(task, initial_state=AgentState.RECEIVED)
         logger.info(f"[TASK] created {task.task_id}")
+        self._record_event(task.task_id, "TASK_CREATED", "Task created", {"user_goal": task.user_goal})
         self.set_state(AgentState.RECEIVED)
 
         # 1. Understanding phase
@@ -232,7 +260,116 @@ class AgentRuntime:
             status=TaskStatus.RUNNING,
             metadata=task.metadata,
         )
+        self._record_event(
+            task_id,
+            "APPROVAL_GRANTED",
+            f"Human approved action: {task.metadata.get('approved_tool_name') or 'action'}",
+            {"feedback": feedback},
+        )
         return task
+
+    def reject_task(self, task_id: str, reason: Optional[str] = None) -> Task:
+        """Rejects a pending action on a task in WAITING_FOR_HUMAN or NEEDS_HUMAN state."""
+        record = self.memory_store.get_task(task_id)
+        if not record:
+            raise KeyError(f"Task '{task_id}' not found in memory store.")
+
+        task = record.task
+        logger.info(f"[APPROVAL] Task {task_id} rejected by human operator.")
+        task.metadata["approval_status"] = "REJECTED"
+        if reason:
+            task.metadata["rejection_reason"] = reason
+        task.status = TaskStatus.FAILED
+
+        reject_event = {
+            "type": "HUMAN_REJECTION",
+            "task_id": task_id,
+            "status": "REJECTED",
+            "reason": reason,
+        }
+        self.memory_store.append_policy_event(task_id, reject_event)
+        self.memory_store.update_task_state(
+            task_id,
+            state=AgentState.FAILED,
+            status=TaskStatus.FAILED,
+            metadata=task.metadata,
+        )
+        self._record_event(
+            task_id,
+            "APPROVAL_REJECTED",
+            f"Human rejected action. Reason: {reason or 'No reason provided'}",
+            {"reason": reason},
+        )
+        return task
+
+    def get_task_events(self, task_id: str, limit: int = 50) -> List[Dict[str, Any]]:
+        """Returns bounded structured chronological operational events for a task."""
+        events = [e for e in self._events if e.get("task_id") == task_id]
+        if events:
+            return sorted(events, key=lambda x: x.get("timestamp", ""))[-limit:]
+
+        # Reconstruct from persistent MemoryStore if runtime instance is new
+        record = self.memory_store.get_task(task_id)
+        if not record:
+            return []
+
+        reconstructed: List[Dict[str, Any]] = []
+        task = record.task
+        reconstructed.append({
+            "task_id": task_id,
+            "event_type": "TASK_CREATED",
+            "message": "Task created",
+            "timestamp": task.created_at.isoformat(),
+            "details": {"user_goal": task.user_goal},
+        })
+
+        for act in record.actions:
+            reconstructed.append({
+                "task_id": task_id,
+                "event_type": "ACTION",
+                "message": f"Planner executed {act.tool_name}",
+                "timestamp": task.updated_at.isoformat(),
+                "details": {"tool_name": act.tool_name, "arguments": act.arguments, "status": act.status.value},
+            })
+
+        for obs in record.observations:
+            msg = "Observation received" if obs.success else f"Observation error: {obs.error}"
+            reconstructed.append({
+                "task_id": task_id,
+                "event_type": "OBSERVATION",
+                "message": msg,
+                "timestamp": task.updated_at.isoformat(),
+                "details": {"success": obs.success, "error": obs.error, "result": obs.result},
+            })
+
+        for pol in record.policy_events:
+            p_type = pol.get("type", "POLICY_DECISION")
+            reconstructed.append({
+                "task_id": task_id,
+                "event_type": "POLICY",
+                "message": f"Policy event: {p_type}",
+                "timestamp": task.updated_at.isoformat(),
+                "details": pol,
+            })
+
+        for rec in record.recovery_events:
+            reconstructed.append({
+                "task_id": task_id,
+                "event_type": "RECOVERY",
+                "message": f"Recovery policy: {rec.get('policy', 'UNKNOWN')}",
+                "timestamp": task.updated_at.isoformat(),
+                "details": rec,
+            })
+
+        reconstructed.append({
+            "task_id": task_id,
+            "event_type": "STATE_CURRENT",
+            "message": f"Current state: {record.state.value} ({task.status.value})",
+            "timestamp": task.updated_at.isoformat(),
+            "details": {"state": record.state.value, "status": task.status.value},
+        })
+
+        return reconstructed[-limit:]
 
     async def resume_task(self, task_id: str) -> Task:
         """Resumes a previously persisted task from its stored state in MemoryStore."""
@@ -509,6 +646,12 @@ class AgentRuntime:
 
         self.memory_store.append_action(task.task_id, action)
         logger.info(f"[MEMORY] action persisted")
+        self._record_event(
+            task.task_id,
+            "ACTION_STARTED",
+            f"Planner selected {action.tool_name}",
+            {"tool_name": action.tool_name, "arguments": action.arguments},
+        )
 
         # Defense-in-depth: check policy as execution gate
         tool = self.tool_registry.get(action.tool_name) if self.tool_registry.has(action.tool_name) else None
@@ -598,9 +741,21 @@ class AgentRuntime:
         if observation.success:
             action.status = ActionStatus.SUCCESS
             logger.info(f"[OBSERVE] Success: {action.tool_name}")
+            self._record_event(
+                task.task_id,
+                "ACTION_SUCCESS",
+                f"{action.tool_name} executed successfully",
+                {"tool_name": action.tool_name, "result": observation.result},
+            )
         else:
             action.status = ActionStatus.FAILED
             logger.warning(f"[OBSERVE] Failure: {action.tool_name} -> {observation.error}")
+            self._record_event(
+                task.task_id,
+                "ACTION_FAILURE",
+                f"{action.tool_name} failed: {observation.error}",
+                {"tool_name": action.tool_name, "error": observation.error},
+            )
 
         self.memory_store.append_action(task.task_id, action)
         return observation

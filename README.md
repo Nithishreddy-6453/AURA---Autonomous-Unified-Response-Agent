@@ -56,6 +56,10 @@ Policy Enforcement (ActionPolicy Engine) ─────► MemoryStore (Policy 
    - Failure classification (`VALIDATION`, `TRANSIENT`, `NAVIGATION_STATE`, `DUPLICATE`, `UNKNOWN`) and recovery policies (`CORRECT_DATA`, `RETRY`, `RESET_AND_RETRY`, `ESCALATE`).
 7. **Independent Verification** ([`backend/verification/`](file:///c:/SAMPLEWEBSITE/centrai/aura-agent/backend/verification/)):
    - Verifies persisted application state independently via backend API, bypassing browser UI assumptions.
+8. **AURA Control Center** ([`frontend/`](file:///c:/SAMPLEWEBSITE/centrai/aura-agent/frontend/)):
+   - Next.js / TypeScript / Tailwind CSS unified operations console on port 3001.
+   - Live activity timeline, task status card, recent task history, and human approval panel (`WAITING_FOR_HUMAN`).
+   - Powered by FastAPI gateway (`backend/api/main.py`) with non-blocking background task execution.
 
 ## Documentation
 
@@ -63,16 +67,39 @@ Policy Enforcement (ActionPolicy Engine) ─────► MemoryStore (Policy 
 - [Adaptive Observation & Re-Planning (Phase 2)](docs/adaptive_planning.md)
 - [Task State Persistence & Short-Term Memory (Phase 3)](docs/memory.md)
 - [Safety, Permissions & Policy Enforcement (Phase 4)](docs/security_and_permissions.md)
+- [AURA Control Center (Phase 5)](docs/control_center.md)
 
-## Running Tests
+## Running the Application
 
-Ensure local Finance Portal is running:
+1. **Finance Portal** (Sandbox App):
 ```bash
 cd company/finance
 npm run start
+# Running at http://localhost:3000
 ```
 
-Run test suite:
+2. **FastAPI Backend Gateway**:
+```bash
+.venv\Scripts\python.exe -m uvicorn backend.api.main:app --host 127.0.0.1 --port 8000
+# Running at http://127.0.0.1:8000
+```
+
+3. **AURA Control Center** (Operations Console):
+```bash
+cd frontend
+npm run start
+# Running at http://localhost:3001
+```
+
+## Running Tests
+
+Run complete Python test suite (including API, Playwright frontend, memory, and recovery tests):
 ```bash
 .venv\Scripts\python.exe -m unittest discover -s tests
+```
+
+Run frontend unit & integration tests:
+```bash
+cd frontend
+npm test
 ```
