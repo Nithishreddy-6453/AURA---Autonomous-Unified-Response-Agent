@@ -123,9 +123,21 @@ class BrowserTypeTool(Tool):
             if is_date_input:
                 # Ensure exact ISO YYYY-MM-DD format is set directly and triggers input/change events
                 clean_date = text.strip()
-                await locator.fill(clean_date)
+                try:
+                    await locator.fill(clean_date)
+                except Exception:
+                    # In case specialized datepicker rejects direct fill
+                    pass
                 # Ensure change and input events dispatch cleanly for React controlled inputs
-                await locator.evaluate("(el, val) => { el.value = val; el.dispatchEvent(new Event('input', { bubbles: true })); el.dispatchEvent(new Event('change', { bubbles: true })); }", clean_date)
+                # Uses safe argument parameterization; no string interpolation into JS
+                await locator.evaluate(
+                    """(element, value) => {
+                        element.value = value;
+                        element.dispatchEvent(new Event('input', { bubbles: true }));
+                        element.dispatchEvent(new Event('change', { bubbles: true }));
+                    }""",
+                    clean_date,
+                )
             else:
                 await locator.fill(text)
 

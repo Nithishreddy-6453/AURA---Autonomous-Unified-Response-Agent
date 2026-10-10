@@ -118,6 +118,11 @@ The Planner never hard-codes tool definitions; it receives tool specifications p
 
 ## Error Handling & Security
 
-- **Sandboxed Navigation**: Reject all external domains (`google.com`, `malicious.com`) and unauthorized ports.
-- **No Arbitrary Execution**: No arbitrary JavaScript evaluation, no arbitrary shell execution, no arbitrary filesystem access.
+- **Configurable Sandboxed Navigation**: Rejects all external domains and unauthorized ports.
+  - Permitted ports are configurable via the `AURA_BROWSER_ALLOWED_PORTS` or `BROWSER_ALLOWED_PORTS` environment variable (e.g. `AURA_BROWSER_ALLOWED_PORTS=3000,3001,8000,8080`).
+  - Default ports: `{3000, 3001}` (Finance Portal and Control Center).
+  - Malformed or invalid port inputs are safely ignored without crashing.
+- **`browser_type` JavaScript Safety**:
+  - For HTML date inputs and React-controlled elements, DOM value dispatching uses safe argument parameterization in Playwright (`locator.evaluate((el, val) => { el.value = val; ... }, clean_val)`).
+  - Absolutely **no** unescaped string interpolation or string concatenation is used in JavaScript execution strings.
 - **Graceful Error Observations**: Timeouts, missing selectors, or invalid navigation destinations produce `Observation(success=False, error=...)` without crashing the agent process.

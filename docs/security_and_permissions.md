@@ -74,19 +74,27 @@ Actions are classified into typed risk categories:
 
 ---
 
-## 5. Human Approval Flow & Resumption
+## 5. Human Approval Flow & Exact Action Binding
 
 When an action is evaluated as `REQUIRES_HUMAN`:
 1. **Execution Halts**: The tool's `execute()` method is **never** called.
-2. **Task State Updated**: The pending action is serialized into `task.metadata["pending_action"]`, along with the human intervention reason.
-3. **State Transition**: The task transitions to `AgentState.WAITING_FOR_HUMAN` and `TaskStatus.WAITING_FOR_HUMAN`, persisted immediately to SQLite.
-4. **Approval API**: An operator reviews the pending action and calls:
+2. **Deterministic Action Fingerprint**: A deterministic SHA-256 fingerprint is calculated from the tool name and canonicalized arguments:
+   `fingerprint = sha256(tool_name + canonical_json(arguments))`
+3. **Task State Updated**: The pending action and its fingerprint are recorded in `task.metadata["pending_action"]` and `task.metadata["pending_action_fingerprint"]`.
+4. **State Transition**: The task transitions to `AgentState.WAITING_FOR_HUMAN` and `TaskStatus.WAITING_FOR_HUMAN`, persisted immediately to SQLite.
+5. **Approval API**: An operator reviews the exact action and calls:
    ```python
    runtime.approve_task(task_id, feedback="Approved by Finance Manager")
    ```
-5. **Durable Approval**: Memory records a `HUMAN_APPROVAL` audit event and marks `approval_status = "APPROVED"`.
-6. **Task Resumption**: Calling `runtime.resume_task(task_id)` detects the approved pending action, executes it, records the observation, and continues the adaptive planning loop until business verification and completion.
-7. **Survives Process Restarts**: Because pending actions and approval states are persisted in SQLite, tasks can be approved and resumed even after a complete process crash or server reboot.
+   This commits `task.metadata["approved_action_fingerprint"] = fingerprint`.
+6. **Exact Match Verification on Resumption**:
+   When `runtime.resume_task(task_id)` resumes execution:
+   - It reconstructs the pending action and recalculates its fingerprint.
+   - It verifies that `current_fingerprint == approved_action_fingerprint`.
+   - **Tamper Protection**: If any parameter has been altered (such as an invoice ID, payment amount, or injected flag), authorization is **immediately invalidated**, the task transitions to `TaskStatus.FAILED`, and the tool is never executed.
+7. **Single-Use Consumption**:
+   Approvals cannot be replayed or reused. Once the approved action executes, `approval_consumed = True` is set and the fingerprint token is removed. Any subsequent sensitive tool proposal requires fresh human approval.
+8. **Survives Process Restarts**: Because pending action fingerprints and approval statuses are persisted in SQLite, exact approved actions survive complete server restarts.
 
 ---
 
@@ -108,6 +116,22 @@ Every evaluation produces a structured log entry without exposing hidden interna
 [POLICY] browser_read → READ → ALLOWED
 [POLICY] browser_type → WRITE → ALLOWED
 [POLICY] submit_payment → SENSITIVE → REQUIRES_HUMAN
+[APPROVAL] fingerprint=319e491bdf...
+[APPROVAL] fingerprint mismatch: expected 319e... got a37c...
+[APPROVAL] authorization invalidated
 [POLICY] delete_record → DESTRUCTIVE → BLOCKED
 [APPROVAL] Task <id> approved by human operator.
 ```
+
+---
+
+## 8. Network Security & CORS Hardening
+
+The FastAPI backend enforces a strict, non-wildcard CORS policy:
+- **No Wildcard Origins**: `allow_origins=["*"]` is completely eliminated.
+- **Configurable Origins**: Controlled via the `AURA_ALLOWED_ORIGINS` environment variable (comma-separated list of permitted origins).
+- **Default Origins**: Restricts access to standard local UI frontends:
+  - `http://localhost:3000` (Finance Portal)
+  - `http://localhost:3001` (Control Center)
+  - `http://127.0.0.1:3000`
+  - `http://127.0.0.1:3001`

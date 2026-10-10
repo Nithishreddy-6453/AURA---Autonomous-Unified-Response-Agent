@@ -1,12 +1,15 @@
+import logging
+import os
+import urllib.request
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Set
 from urllib.parse import urlparse
-from typing import Any, Dict, List, Optional
 
 from backend.models.observation import Observation
 from backend.tools.base import Tool
 from backend.tools.browser.browser_session import BrowserSession
 
-from pathlib import Path
-import urllib.request
+logger = logging.getLogger(__name__)
 
 # Permitted domains/hosts for browser navigation
 ALLOWED_HOSTS = {
@@ -14,7 +17,35 @@ ALLOWED_HOSTS = {
     "127.0.0.1",
     "[::1]",
 }
-ALLOWED_PORTS = {3000}
+
+DEFAULT_ALLOWED_PORTS: Set[int] = {3000, 3001}
+
+
+def get_allowed_ports() -> Set[int]:
+    """Retrieves and safely validates allowed browser navigation ports from environment or defaults.
+    
+    Supports comma-separated integers via AURA_BROWSER_ALLOWED_PORTS or BROWSER_ALLOWED_PORTS.
+    Invalid or out-of-range values are ignored with warnings.
+    """
+    env_val = os.getenv("AURA_BROWSER_ALLOWED_PORTS") or os.getenv("BROWSER_ALLOWED_PORTS")
+    if not env_val:
+        return set(DEFAULT_ALLOWED_PORTS)
+
+    parsed_ports: Set[int] = set()
+    for item in env_val.split(","):
+        cleaned = item.strip()
+        if not cleaned:
+            continue
+        try:
+            port_num = int(cleaned)
+            if 1 <= port_num <= 65535:
+                parsed_ports.add(port_num)
+            else:
+                logger.warning(f"Ignoring out-of-range port '{cleaned}' in browser port configuration.")
+        except ValueError:
+            logger.warning(f"Ignoring malformed port '{cleaned}' in browser port configuration.")
+
+    return parsed_ports if parsed_ports else set(DEFAULT_ALLOWED_PORTS)
 
 
 def is_url_allowed(url: str) -> bool:
@@ -33,7 +64,8 @@ def is_url_allowed(url: str) -> bool:
         if not hostname or hostname.lower() not in ALLOWED_HOSTS:
             return False
         port = parsed.port or (80 if parsed.scheme == "http" else 443)
-        if port not in ALLOWED_PORTS and not (parsed.scheme == "http" and port == 3000):
+        allowed_ports = get_allowed_ports()
+        if port not in allowed_ports:
             return False
         return True
     except Exception:
@@ -87,7 +119,7 @@ class BrowserNavigateTool(Tool):
                 success=False,
                 error=(
                     f"Navigation rejected: URL '{url}' is outside permitted local origins "
-                    f"(Allowed: http://localhost:3000)."
+                    f"(Allowed ports: {sorted(list(get_allowed_ports()))})."
                 ),
             )
 

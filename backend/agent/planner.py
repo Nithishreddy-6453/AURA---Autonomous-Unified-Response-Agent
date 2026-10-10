@@ -242,6 +242,25 @@ class Planner:
                 reasoning=f"Failed to parse LLM response as JSON: {raw_response}",
             )
 
+        # If the response conforms to a full plan schema rather than next-step schema (e.g. from static mock)
+        if "actions" in parsed_data and "action" not in parsed_data and "is_complete" not in parsed_data:
+            planned_actions = parsed_data.get("actions", [])
+            if len(action_history) >= len(planned_actions):
+                return NextActionResponseSchema(
+                    is_complete=True,
+                    completion_summary=f"Completed all {len(action_history)} planned actions.",
+                )
+            elif len(action_history) < len(planned_actions):
+                next_act_dict = planned_actions[len(action_history)]
+                return NextActionResponseSchema(
+                    is_complete=False,
+                    action=PlanActionSchema(
+                        tool_name=next_act_dict.get("tool_name"),
+                        arguments=next_act_dict.get("arguments", {}),
+                    ),
+                    reasoning=f"Executing planned step {len(action_history) + 1}",
+                )
+
         try:
             decision = NextActionResponseSchema.model_validate(parsed_data)
         except Exception as e:

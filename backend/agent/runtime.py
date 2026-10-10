@@ -16,7 +16,7 @@ from backend.verification.finance_verifier import FinanceInvoiceVerifier
 from backend.memory.base import MemoryStore
 from backend.memory.sqlite_store import SQLiteMemoryStore
 from backend.policy.decision import PolicyDecision
-from backend.policy.engine import ActionPolicy, DefaultActionPolicy
+from backend.policy.engine import ActionPolicy, DefaultActionPolicy, compute_action_fingerprint
 
 logger = logging.getLogger(__name__)
 
@@ -185,7 +185,9 @@ class AgentRuntime:
 
                 if decision.requires_human:
                     logger.info(f"[WAITING_FOR_HUMAN] {decision.reason}")
+                    fp = compute_action_fingerprint(action.tool_name, action.arguments)
                     task.metadata["pending_action"] = action.model_dump()
+                    task.metadata["pending_action_fingerprint"] = fp
                     task.metadata["human_intervention_reason"] = decision.reason
                     self.set_state(AgentState.WAITING_FOR_HUMAN, status=TaskStatus.WAITING_FOR_HUMAN)
                     return task
@@ -240,8 +242,13 @@ class AgentRuntime:
         task.metadata["approval_status"] = "APPROVED"
         pending_act = task.metadata.get("pending_action")
         if pending_act:
+            tool_name = pending_act.get("tool_name", "")
+            args = pending_act.get("arguments", {})
+            fp = compute_action_fingerprint(tool_name, args)
             task.metadata["approved_action_id"] = pending_act.get("action_id")
-            task.metadata["approved_tool_name"] = pending_act.get("tool_name")
+            task.metadata["approved_tool_name"] = tool_name
+            task.metadata["approved_action_fingerprint"] = fp
+            logger.info(f"[APPROVAL] fingerprint={fp}")
         if feedback:
             task.metadata["approval_feedback"] = feedback
         task.status = TaskStatus.RUNNING
@@ -417,8 +424,25 @@ class AgentRuntime:
         if task.metadata.get("pending_action") and is_approved:
             pending_action_dict = task.metadata.pop("pending_action")
             pending_action = Action.model_validate(pending_action_dict)
+            current_fp = compute_action_fingerprint(pending_action.tool_name, pending_action.arguments)
+            approved_fp = task.metadata.get("approved_action_fingerprint")
+
+            if approved_fp and current_fp != approved_fp:
+                logger.error(
+                    f"[APPROVAL] fingerprint mismatch: expected {approved_fp}, got {current_fp}"
+                )
+                logger.warning("[APPROVAL] authorization invalidated")
+                task.metadata["approval_status"] = "INVALIDATED"
+                task.metadata.pop("approved_action_fingerprint", None)
+                task.metadata["error"] = "Approved action fingerprint mismatch. Action arguments were altered."
+                self.memory_store.update_task_state(
+                    task_id, state=AgentState.FAILED, status=TaskStatus.FAILED, metadata=task.metadata
+                )
+                self.set_state(AgentState.FAILED, status=TaskStatus.FAILED)
+                return task
+
             logger.info(
-                f"[RESUME] Executing approved pending action '{pending_action.tool_name}'"
+                f"[RESUME] Executing approved pending action '{pending_action.tool_name}' (fingerprint={current_fp})"
             )
             obs = await self._execute_single_action(pending_action, task)
             recovery_context = None
@@ -447,12 +471,32 @@ class AgentRuntime:
     ) -> Task:
         """Core adaptive execution loop driven by observations and bounded short-term memory."""
         while steps_taken < self.max_dynamic_steps:
-            next_decision = await self.planner.decide_next_action(
-                task=task,
-                action_history=self.executed_actions,
-                observations=self.observations,
-                recovery_context=recovery_context,
-            )
+            try:
+                next_decision = await self.planner.decide_next_action(
+                    task=task,
+                    action_history=self.executed_actions,
+                    observations=self.observations,
+                    recovery_context=recovery_context,
+                )
+            except Exception as e:
+                logger.error(f"[PLANNER ERROR] decide_next_action exception: {e}")
+                policy = self.recovery_manager.handle_failure(task, str(e), "planner")
+                self.memory_store.append_recovery_event(task.task_id, {
+                    "source": "planner",
+                    "policy": policy,
+                    "error": str(e),
+                })
+                logger.info(f"[RECOVERY] Failure classified for 'planner'. Policy: {policy}")
+                if policy == "ESCALATE":
+                    logger.warning(f"[ESCALATE] Unrecoverable planner failure: {e}")
+                    task.status = TaskStatus.FAILED
+                    task.metadata["error"] = f"Planner exception: {e}"
+                    self.set_state(AgentState.FAILED, status=TaskStatus.FAILED)
+                    return task
+                else:
+                    recovery_context = f"Planner exception: {e}. Policy: {policy}. Please produce a valid action or declare completion."
+                    steps_taken += 1
+                    continue
 
             # Check if human intervention requested
             if next_decision.needs_human:
@@ -467,12 +511,28 @@ class AgentRuntime:
             if next_decision.is_complete:
                 logger.info(f"[PLAN] Completion proposed: {next_decision.completion_summary}")
                 task.metadata["completion_summary"] = next_decision.completion_summary
-
                 self.set_state(AgentState.VERIFYING)
-                extracted_data = self._extract_data_from_actions()
 
-                if extracted_data.get("invoice_id"):
-                    verification_result = await self.finance_verifier.verify(task.metadata, extracted_data)
+                # Independent Verification against source of truth
+                source_ref = (
+                    task.metadata.get("source_document")
+                    or task.metadata.get("source_file")
+                    or task.metadata.get("source_reference")
+                )
+                if not source_ref:
+                    for act in self.executed_actions:
+                        if act.tool_name in ("read_company_file", "document_extract"):
+                            fp = act.arguments.get("file_path", "")
+                            if fp and ("invoice" in fp.lower() or fp.endswith(".txt")):
+                                source_ref = fp
+                                break
+
+                is_invoice_task = bool(source_ref) or (
+                    "invoice" in task.user_goal.lower() and "finance" in task.user_goal.lower()
+                )
+
+                if is_invoice_task:
+                    verification_result = await self.finance_verifier.verify(task.metadata, source_reference=source_ref)
                     if not verification_result.is_verified:
                         logger.warning(f"[VERIFY] Verification failed: {verification_result.details}")
                         policy = self.recovery_manager.handle_failure(task, verification_result.details, "finance_verifier")
@@ -484,9 +544,9 @@ class AgentRuntime:
                         logger.info(f"[MEMORY] recovery event persisted")
                         if policy == "ESCALATE":
                             self.set_state(AgentState.ADAPTING)
-                            task.status = TaskStatus.NEEDS_HUMAN
+                            task.status = TaskStatus.FAILED
                             task.metadata["error"] = verification_result.details
-                            self.set_state(AgentState.NEEDS_HUMAN, status=TaskStatus.NEEDS_HUMAN)
+                            self.set_state(AgentState.FAILED, status=TaskStatus.FAILED)
                             return task
                         elif policy == "CORRECT_DATA":
                             logger.info("[ADAPT] Recovering from verification failure by correcting data...")
@@ -494,12 +554,12 @@ class AgentRuntime:
                             obs = Observation(
                                 action_id="verifier",
                                 success=False,
-                                error=f"Verification failed: {verification_result.details}. Please correct the data before saving again.",
+                                error=f"Verification failed against source truth: {verification_result.details}. Please correct the data before saving again.",
                             )
                             self.observations.append(obs)
                             self.memory_store.append_observation(task.task_id, obs)
                             logger.info(f"[MEMORY] observation persisted")
-                            recovery_context = f"Verification failed: {verification_result.details}. Policy: CORRECT_DATA."
+                            recovery_context = f"Verification failed against source truth: {verification_result.details}. Policy: CORRECT_DATA."
                             steps_taken += 1
                             continue
 
@@ -507,9 +567,28 @@ class AgentRuntime:
                 self.set_state(AgentState.COMPLETED, status=TaskStatus.COMPLETED)
                 return task
 
-            # If no action is proposed and not explicitly complete, exit loop
+            # If no action is proposed and not explicitly complete, this is a planner failure!
             if not next_decision.action:
-                break
+                err_msg = next_decision.reasoning or "Planner failed to produce a valid next action or completion decision."
+                logger.error(f"[PLANNER ERROR] {err_msg}")
+                policy = self.recovery_manager.handle_failure(task, err_msg, "planner")
+                self.memory_store.append_recovery_event(task.task_id, {
+                    "source": "planner",
+                    "policy": policy,
+                    "error": err_msg,
+                })
+                logger.info(f"[RECOVERY] Failure classified for 'planner'. Policy: {policy}")
+                if policy == "ESCALATE":
+                    logger.warning(f"[ESCALATE] Unrecoverable planner failure: {err_msg}")
+                    self.set_state(AgentState.ADAPTING)
+                    task.status = TaskStatus.FAILED
+                    task.metadata["error"] = err_msg
+                    self.set_state(AgentState.FAILED, status=TaskStatus.FAILED)
+                    return task
+                else:
+                    recovery_context = f"Planner failure: {err_msg}. Policy: {policy}. Please produce a valid registered action or declare completion."
+                    steps_taken += 1
+                    continue
 
             # Prepare next action
             next_action = Action(
@@ -549,7 +628,9 @@ class AgentRuntime:
 
             if decision.requires_human:
                 logger.info(f"[WAITING_FOR_HUMAN] {decision.reason}")
+                fp = compute_action_fingerprint(next_action.tool_name, next_action.arguments)
                 task.metadata["pending_action"] = next_action.model_dump()
+                task.metadata["pending_action_fingerprint"] = fp
                 task.metadata["human_intervention_reason"] = decision.reason
                 self.set_state(AgentState.WAITING_FOR_HUMAN, status=TaskStatus.WAITING_FOR_HUMAN)
                 return task
@@ -611,9 +692,11 @@ class AgentRuntime:
             self.set_state(AgentState.FAILED, status=TaskStatus.FAILED)
             return task
 
-        # 4. Verifying / Completion
-        self.set_state(AgentState.VERIFYING)
-        self.set_state(AgentState.COMPLETED, status=TaskStatus.COMPLETED)
+        # Loop terminated without explicit completion: must NEVER be marked COMPLETED
+        logger.error("[FAILED] Planner did not produce a valid completion decision.")
+        task.status = TaskStatus.FAILED
+        task.metadata["error"] = "Planner did not produce a valid completion decision."
+        self.set_state(AgentState.FAILED, status=TaskStatus.FAILED)
         return task
 
     def _extract_data_from_actions(self) -> Dict[str, Any]:
@@ -674,11 +757,19 @@ class AgentRuntime:
             logger.warning(f"[OBSERVE] Action blocked by policy: {action.tool_name}")
             return obs
 
-        is_approved = (
+        action_fp = compute_action_fingerprint(action.tool_name, action.arguments)
+        approved_fp = task.metadata.get("approved_action_fingerprint")
+        is_approved = bool(
             task.metadata.get("approval_status") == "APPROVED"
             and (
-                task.metadata.get("approved_action_id") == action.action_id
-                or task.metadata.get("approved_tool_name") == action.tool_name
+                (approved_fp and approved_fp == action_fp)
+                or (
+                    not approved_fp
+                    and (
+                        task.metadata.get("approved_action_id") == action.action_id
+                        or task.metadata.get("approved_tool_name") == action.tool_name
+                    )
+                )
             )
         )
         if decision.requires_human and not is_approved:
@@ -741,6 +832,18 @@ class AgentRuntime:
         if observation.success:
             action.status = ActionStatus.SUCCESS
             logger.info(f"[OBSERVE] Success: {action.tool_name}")
+            # Single-use consumption of approval authorization
+            if approved_fp and approved_fp == action_fp:
+                task.metadata.pop("approved_action_fingerprint", None)
+                task.metadata["approval_consumed"] = True
+                self.memory_store.update_task_state(task.task_id, state=self.state, metadata=task.metadata)
+            # Track source document for independent verification
+            if action.tool_name in ("read_company_file", "document_extract"):
+                fp = action.arguments.get("file_path")
+                if fp:
+                    task.metadata["source_document"] = fp
+                    self.memory_store.update_task_state(task.task_id, state=self.state, metadata=task.metadata)
+
             self._record_event(
                 task.task_id,
                 "ACTION_SUCCESS",

@@ -1,3 +1,5 @@
+import hashlib
+import json
 import logging
 from abc import ABC, abstractmethod
 from typing import Any, Callable, Dict, Optional, Set
@@ -9,6 +11,22 @@ from backend.policy.risk import ActionRisk
 from backend.tools.base import Tool
 
 logger = logging.getLogger(__name__)
+
+
+def compute_action_fingerprint(tool_name: str, arguments: Optional[Dict[str, Any]] = None) -> str:
+    """Computes a deterministic SHA-256 fingerprint for a tool name and canonicalized arguments.
+
+    Arguments are serialized with sorted keys and normalized separators so dictionary key order
+    does not affect the fingerprint.
+    """
+    canonical_json = json.dumps(
+        arguments or {},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+    payload = f"{tool_name}:{canonical_json}".encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 class ActionPolicy(ABC):
@@ -99,14 +117,27 @@ class DefaultActionPolicy(ActionPolicy):
         # 3. Classify risk level based on tool metadata and action context
         risk_level = self._classify_action_risk(action, tool)
 
-        # 4. Check if human approval was already granted for this action
-        is_approved = (
-            task.metadata.get("approval_status") == "APPROVED"
-            and (
+        # 4. Check if human approval was already granted and binds to exact action identity
+        action_fp = compute_action_fingerprint(action.tool_name, action.arguments)
+        approved_fp = task.metadata.get("approved_action_fingerprint")
+
+        is_consumed = task.metadata.get("approval_consumed", False)
+        is_approved = False
+        if task.metadata.get("approval_status") == "APPROVED" and not is_consumed:
+            if approved_fp:
+                if approved_fp == action_fp:
+                    is_approved = True
+                else:
+                    logger.warning(
+                        f"[APPROVAL] Fingerprint mismatch! Action '{action.tool_name}' with args {action.arguments} "
+                        f"produced fingerprint '{action_fp}', which does not match approved '{approved_fp}'. "
+                        "Authorization invalidated."
+                    )
+            elif (
                 task.metadata.get("approved_action_id") == action.action_id
                 or task.metadata.get("approved_tool_name") == action.tool_name
-            )
-        )
+            ):
+                is_approved = True
 
         # 5. Apply risk-level policy rules
         if risk_level == ActionRisk.DESTRUCTIVE:

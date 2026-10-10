@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 from typing import Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Query, status
@@ -21,6 +22,24 @@ from backend.models.task import Task, TaskStatus
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_ALLOWED_ORIGINS: List[str] = [
+    "http://localhost:3000",
+    "http://localhost:3001",
+    "http://127.0.0.1:3000",
+    "http://127.0.0.1:3001",
+]
+
+
+def get_allowed_origins() -> List[str]:
+    """Retrieves and parses allowed frontend origins from environment or defaults."""
+    env_origins = os.getenv("AURA_ALLOWED_ORIGINS") or os.getenv("ALLOWED_ORIGINS")
+    if not env_origins:
+        return list(DEFAULT_ALLOWED_ORIGINS)
+
+    origins = [orig.strip() for orig in env_origins.split(",") if orig.strip()]
+    return origins if origins else list(DEFAULT_ALLOWED_ORIGINS)
+
+
 app = FastAPI(
     title="AURA Agent API",
     description="Autonomous Unified Response Agent API and Control Center Gateway",
@@ -30,7 +49,7 @@ app = FastAPI(
 # CORS configuration for Control Center and Finance Portal
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=get_allowed_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

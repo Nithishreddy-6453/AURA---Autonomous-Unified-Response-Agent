@@ -71,15 +71,21 @@ To prevent infinite loops or redundant tool calls:
 
 ---
 
-## 6. Why Independent Verification is Still Required
+## 6. Completion Semantics & Independent Source-of-Truth Verification
 
-Logical completion proposed by the LLM (`"is_complete": true`) is a belief, not ground truth.
-- The UI might report success while the database write silently dropped a field.
-- A client-side form might transition without updating the underlying backend record.
+### Explicit Completion Semantics (Never Inferred)
+- **Strict Requirement**: A task terminates as `COMPLETED` **only** if the Planner explicitly declares `is_complete == True` and verification passes.
+- **Never Inferred**: Lack of a next action, planner exceptions, malformed JSON, or unregistered tool calls are classified as planner errors. They trigger error recovery or transition to `TaskStatus.FAILED`; they **never** fall through to completion.
 
-Therefore, when the Planner declares completion:
-1. Runtime enters `AgentState.VERIFYING`.
-2. The independent verifier ([`FinanceInvoiceVerifier`](file:///c:/SAMPLEWEBSITE/centrai/aura-agent/backend/verification/finance_verifier.py)) bypasses the browser UI and directly queries the backend REST API (`/api/finance/invoices/[id]`).
-3. Field-by-field validation checks `company`, `invoice_date`, `due_date`, and `amount`.
-4. Only upon independent confirmation does the task transition to `AgentState.COMPLETED`.
-5. If verification detects a discrepancy, the failure feeds directly back into the adaptive loop with recovery context, allowing the agent to correct the persisted record.
+### Breaking Circular Verification
+Previous verifiers checked whether the portal contained what AURA itself typed during browser automation—validating AURA's own mistakes.
+In the stabilized architecture:
+1. **Authoritative Source on Disk**: The verifier ([`FinanceInvoiceVerifier`](file:///C:/SAMPLEWEBSITE/centrai/aura-agent/backend/verification/finance_verifier.py)) identifies the source document (`data/company/invoices/...`) and parses authoritative fields directly from disk.
+2. **Independent Portal Query**: The verifier independently queries the portal backend REST API (`/api/finance/invoices/[id]`).
+3. **Ground Truth Comparison**: Expected values are sourced purely from the original company document, checking:
+   - `invoice_id`
+   - `company` / vendor
+   - `amount` (numeric float comparison)
+   - `invoice_date`
+   - `due_date`
+4. If values diverge or the source document is missing, verification fails and the task either adapts or transitions to `TaskStatus.FAILED`.
