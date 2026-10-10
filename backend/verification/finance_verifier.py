@@ -6,9 +6,11 @@ from typing import Any, Dict, Optional, Union
 
 import httpx
 
+from backend.models.task import Task
 from backend.verification.verifier import BaseVerifier, VerificationResult
 
 logger = logging.getLogger(__name__)
+
 
 
 def parse_source_document(
@@ -78,6 +80,8 @@ class FinanceInvoiceVerifier(BaseVerifier):
     the authoritative source invoice document on disk (ground truth).
     """
 
+    source_name: str = "finance_verifier"
+
     def __init__(self, base_url: str = "http://localhost:3000", data_dir: Optional[Union[str, Path]] = None):
         self.base_url = base_url
         if data_dir:
@@ -85,6 +89,29 @@ class FinanceInvoiceVerifier(BaseVerifier):
         else:
             project_root = Path(__file__).resolve().parents[2]
             self.data_dir = (project_root / "data" / "company").resolve()
+
+    def can_verify(self, task: Task) -> bool:
+        """Determines whether this verifier should handle the task.
+
+        Matches if:
+        1. The task metadata specifies a source document/file/reference, OR
+        2. The task user goal contains both 'invoice' and 'finance' (case-insensitive).
+        """
+        if not task:
+            return False
+        meta = task.metadata if isinstance(task.metadata, dict) else {}
+        source_ref = (
+            meta.get("source_document")
+            or meta.get("source_file")
+            or meta.get("source_reference")
+            or meta.get("source_ref")
+        )
+        if bool(source_ref):
+            return True
+
+        goal = (task.user_goal or "").lower()
+        return "invoice" in goal and "finance" in goal
+
 
     def parse_source_document(self, file_path: Union[str, Path]) -> Dict[str, Any]:
         """Independently reads and extracts authoritative fields from a source invoice document."""
@@ -225,3 +252,43 @@ class FinanceInvoiceVerifier(BaseVerifier):
             expected=source_truth,
             actual=actual_data,
         )
+
+
+class LegacyFinanceVerifierAdapter(BaseVerifier):
+    """Compatibility adapter wrapping legacy or test-double Finance verifiers
+
+    that do not implement can_verify(task). Avoids monkey-patching user-supplied verifiers.
+    """
+
+    source_name: str = "finance_verifier"
+
+    def __init__(self, wrapped: Any) -> None:
+        self.wrapped = wrapped
+
+    def can_verify(self, task: Task) -> bool:
+        if hasattr(self.wrapped, "can_verify") and callable(self.wrapped.can_verify):
+            return self.wrapped.can_verify(task)
+        if not task:
+            return False
+        meta = task.metadata if isinstance(task.metadata, dict) else {}
+        source_ref = (
+            meta.get("source_document")
+            or meta.get("source_file")
+            or meta.get("source_reference")
+            or meta.get("source_ref")
+        )
+        if bool(source_ref):
+            return True
+        goal = (task.user_goal or "").lower()
+        return "invoice" in goal and "finance" in goal
+
+    async def verify(
+        self,
+        task_metadata: Dict[str, Any],
+        source_reference: Optional[Union[str, Path, Dict[str, Any]]] = None,
+    ) -> VerificationResult:
+        try:
+            return await self.wrapped.verify(task_metadata, source_reference=source_reference)
+        except TypeError:
+            return await self.wrapped.verify(task_metadata, source_reference)
+

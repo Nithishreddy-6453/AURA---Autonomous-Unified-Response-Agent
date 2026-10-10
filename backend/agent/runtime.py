@@ -12,13 +12,27 @@ from backend.models.plan import Plan
 from backend.models.task import Task, TaskStatus
 from backend.tools import ToolRegistry, get_default_tool_registry
 from backend.recovery.recovery_manager import RecoveryManager
-from backend.verification.finance_verifier import FinanceInvoiceVerifier
+from backend.verification.verifier import BaseVerifier
+from backend.verification.finance_verifier import (
+    FinanceInvoiceVerifier,
+    LegacyFinanceVerifierAdapter,
+)
+from backend.verification.registry import VerifierRegistry, get_default_verifier_registry
 from backend.memory.base import MemoryStore
 from backend.memory.sqlite_store import SQLiteMemoryStore
 from backend.policy.decision import PolicyDecision
 from backend.policy.engine import ActionPolicy, DefaultActionPolicy, compute_action_fingerprint
 
 logger = logging.getLogger(__name__)
+
+
+def _is_finance_verifier(v: Any) -> bool:
+    """Identifies FinanceInvoiceVerifier or a compatible finance verifier adapter."""
+    return (
+        isinstance(v, (FinanceInvoiceVerifier, LegacyFinanceVerifierAdapter))
+        or getattr(v, "source_name", None) == "finance_verifier"
+        or getattr(v, "__class__", None).__name__ == "FinanceInvoiceVerifier"
+    )
 
 
 class AgentRuntime:
@@ -44,6 +58,7 @@ class AgentRuntime:
         planner: Optional[Planner] = None,
         memory_store: Optional[MemoryStore] = None,
         policy: Optional[ActionPolicy] = None,
+        verifier_registry: Optional[VerifierRegistry] = None,
         on_state_change: Optional[Callable[[AgentState, Task], None]] = None,
         on_action: Optional[Callable[[Action], None]] = None,
         on_observation: Optional[Callable[[Action, Observation], None]] = None,
@@ -57,6 +72,9 @@ class AgentRuntime:
         )
         self.memory_store: MemoryStore = memory_store or SQLiteMemoryStore()
         self.policy: ActionPolicy = policy or DefaultActionPolicy()
+        self.verifier_registry: VerifierRegistry = (
+            verifier_registry if verifier_registry is not None else get_default_verifier_registry()
+        )
         self.state: AgentState = AgentState.RECEIVED
         self.on_state_change = on_state_change
         self.on_action = on_action
@@ -67,8 +85,38 @@ class AgentRuntime:
         self.executed_actions: List[Action] = []
         self.observations: List[Observation] = []
         self.recovery_manager = RecoveryManager()
-        self.finance_verifier = FinanceInvoiceVerifier()
         self._events: List[Dict[str, Any]] = []
+
+    @property
+    def finance_verifier(self) -> Optional[Any]:
+        """Backward compatibility property returning the registered FinanceInvoiceVerifier
+
+        or compatible Finance-verifier adapter. Returns None if no finance verifier is registered.
+        """
+        for v in self.verifier_registry.verifiers:
+            if isinstance(v, LegacyFinanceVerifierAdapter):
+                return v.wrapped
+            if _is_finance_verifier(v):
+                return v
+        return None
+
+    @finance_verifier.setter
+    def finance_verifier(self, verifier: Any) -> None:
+        """Backward compatibility setter allowing custom/mock verifiers to replace
+
+        the registered finance verifier while preserving any other registered domain verifiers.
+        """
+        if isinstance(verifier, (FinanceInvoiceVerifier, LegacyFinanceVerifierAdapter)):
+            replacement = verifier
+        else:
+            replacement = LegacyFinanceVerifierAdapter(verifier)
+
+        replaced = self.verifier_registry.replace_verifier(replacement, _is_finance_verifier)
+        if not replaced:
+            self.verifier_registry.register(replacement)
+
+
+
 
     def _record_event(
         self,
@@ -525,19 +573,18 @@ class AgentRuntime:
                             fp = act.arguments.get("file_path", "")
                             if fp and ("invoice" in fp.lower() or fp.endswith(".txt")):
                                 source_ref = fp
+                                task.metadata["source_document"] = fp
                                 break
 
-                is_invoice_task = bool(source_ref) or (
-                    "invoice" in task.user_goal.lower() and "finance" in task.user_goal.lower()
-                )
-
-                if is_invoice_task:
-                    verification_result = await self.finance_verifier.verify(task.metadata, source_reference=source_ref)
+                verifier = self.verifier_registry.get_verifier(task)
+                if verifier is not None:
+                    verifier_source = getattr(verifier, "source_name", verifier.__class__.__name__)
+                    verification_result = await verifier.verify(task.metadata, source_reference=source_ref)
                     if not verification_result.is_verified:
                         logger.warning(f"[VERIFY] Verification failed: {verification_result.details}")
-                        policy = self.recovery_manager.handle_failure(task, verification_result.details, "finance_verifier")
+                        policy = self.recovery_manager.handle_failure(task, verification_result.details, verifier_source)
                         self.memory_store.append_recovery_event(task.task_id, {
-                            "source": "finance_verifier",
+                            "source": verifier_source,
                             "policy": policy,
                             "details": verification_result.details,
                         })
@@ -562,6 +609,7 @@ class AgentRuntime:
                             recovery_context = f"Verification failed against source truth: {verification_result.details}. Policy: CORRECT_DATA."
                             steps_taken += 1
                             continue
+
 
                 logger.info("[COMPLETE] Task successfully verified and completed.")
                 self.set_state(AgentState.COMPLETED, status=TaskStatus.COMPLETED)
