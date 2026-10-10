@@ -22,6 +22,7 @@ from backend.memory.base import MemoryStore
 from backend.memory.sqlite_store import SQLiteMemoryStore
 from backend.policy.decision import PolicyDecision
 from backend.policy.engine import ActionPolicy, DefaultActionPolicy, compute_action_fingerprint
+from backend.policy.rules import DomainRiskRule
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +61,7 @@ class AgentRuntime:
         policy: Optional[ActionPolicy] = None,
         verifier_registry: Optional[VerifierRegistry] = None,
         domain_guidelines: Optional[Sequence[str]] = None,
+        domain_rules: Optional[Sequence[DomainRiskRule]] = None,
         on_state_change: Optional[Callable[[AgentState, Task], None]] = None,
         on_action: Optional[Callable[[Action], None]] = None,
         on_observation: Optional[Callable[[Action, Observation], None]] = None,
@@ -74,10 +76,16 @@ class AgentRuntime:
         )
 
         self.memory_store: MemoryStore = memory_store or SQLiteMemoryStore()
-        self.policy: ActionPolicy = policy or DefaultActionPolicy()
+        if policy is not None:
+            self.policy: ActionPolicy = policy
+            if domain_rules and hasattr(self.policy, "register_rules"):
+                self.policy.register_rules(domain_rules)
+        else:
+            self.policy = DefaultActionPolicy(domain_rules=domain_rules)
         self.verifier_registry: VerifierRegistry = (
             verifier_registry if verifier_registry is not None else get_default_verifier_registry()
         )
+
         self.state: AgentState = AgentState.RECEIVED
         self.on_state_change = on_state_change
         self.on_action = on_action
