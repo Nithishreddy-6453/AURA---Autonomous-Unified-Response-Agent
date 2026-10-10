@@ -23,6 +23,7 @@ from backend.memory.sqlite_store import SQLiteMemoryStore
 from backend.policy.decision import PolicyDecision
 from backend.policy.engine import ActionPolicy, DefaultActionPolicy, compute_action_fingerprint
 from backend.policy.rules import DomainRiskRule
+from backend.agent.domains import DEFAULT_DOMAIN, get_domain_config
 
 logger = logging.getLogger(__name__)
 
@@ -70,7 +71,6 @@ class AgentRuntime:
     ) -> None:
         self.domain = domain
         if domain:
-            from backend.agent.domains import get_domain_config
             cfg = get_domain_config(domain)
             if domain_guidelines is None:
                 domain_guidelines = list(cfg.guidelines)
@@ -185,27 +185,78 @@ class AgentRuntime:
         if self.on_state_change and self.current_task:
             self.on_state_change(new_state, self.current_task)
 
+    def _sync_domain_configuration(self, task: Task) -> str:
+        """Synchronizes and validates domain configuration between task metadata and runtime.
+
+        Ensures runtime domain, planner guidelines, policy rules, and verifier registry
+        accurately reflect the task's authoritative domain.
+
+        Raises:
+            ValueError: If the task's domain is unrecognized.
+        """
+        meta_domain = task.metadata.get("domain") if isinstance(task.metadata, dict) else None
+        target_domain_name = meta_domain or self.domain or DEFAULT_DOMAIN
+
+        cfg = get_domain_config(target_domain_name)
+        resolved_domain = cfg.name
+
+        self.domain = resolved_domain
+        if isinstance(task.metadata, dict):
+            task.metadata["domain"] = resolved_domain
+
+        # 1. Restore domain planner guidelines
+        if hasattr(self.planner, "domain_guidelines"):
+            self.planner.domain_guidelines = list(cfg.guidelines)
+
+        # 2. Restore domain policy rules idempotently without cross-domain pollution
+        if hasattr(self.policy, "domain_rules") and isinstance(self.policy.domain_rules, list):
+            from backend.agent.domains import DOMAINS
+
+            all_managed_rule_names = {
+                r.name for d in DOMAINS.values() for r in d.policy_rules
+            }
+            active_domain_rule_names = {r.name for r in cfg.policy_rules}
+            other_domain_rule_names = all_managed_rule_names - active_domain_rule_names
+
+            # Prune domain rules belonging to other domains while preserving caller custom rules
+            self.policy.domain_rules = [
+                r for r in self.policy.domain_rules if r.name not in other_domain_rule_names
+            ]
+
+            # Add active domain rules if not already present
+            existing_names = {r.name for r in self.policy.domain_rules}
+            for rule in cfg.policy_rules:
+                if rule.name not in existing_names:
+                    self.policy.domain_rules.append(rule)
+                    existing_names.add(rule.name)
+        elif cfg.policy_rules and hasattr(self.policy, "register_rules"):
+            self.policy.register_rules(cfg.policy_rules)
+
+        # 3. Restore / select domain verifier
+        if resolved_domain == "hr":
+            from backend.verification.hr_verifier import HROnboardingVerifier
+
+            if not any(isinstance(v, HROnboardingVerifier) for v in self.verifier_registry.verifiers):
+                self.verifier_registry.register(HROnboardingVerifier())
+
+        return resolved_domain
+
     async def execute_task(self, task: Task, use_dynamic_adaptation: bool = True) -> Task:
         """Runs the orchestrator through the adaptive task lifecycle with memory persistence."""
         self.current_task = task
         self.observations.clear()
         self.executed_actions.clear()
 
-        # Set or preserve domain in metadata
-        if self.domain and "domain" not in task.metadata:
-            task.metadata["domain"] = self.domain
-        elif task.metadata.get("domain") and not self.domain:
-            self.domain = task.metadata["domain"]
-            from backend.agent.domains import get_domain_config
-            cfg = get_domain_config(self.domain)
-            if hasattr(self.planner, "domain_guidelines"):
-                self.planner.domain_guidelines = list(cfg.guidelines)
-            if cfg.policy_rules and hasattr(self.policy, "register_rules"):
-                self.policy.register_rules(cfg.policy_rules)
-            if self.domain == "hr":
-                from backend.verification.hr_verifier import HROnboardingVerifier
-                if not any(isinstance(v, HROnboardingVerifier) for v in self.verifier_registry.verifiers):
-                    self.verifier_registry.register(HROnboardingVerifier())
+        # Synchronize and validate domain configuration
+        try:
+            self._sync_domain_configuration(task)
+        except ValueError as e:
+            logger.error(f"[TASK] Invalid domain in task metadata: {e}")
+            task.status = TaskStatus.FAILED
+            task.metadata["error"] = str(e)
+            self.memory_store.create_task(task, initial_state=AgentState.FAILED)
+            self.set_state(AgentState.FAILED, status=TaskStatus.FAILED)
+            return task
 
         # Persist task creation
         self.memory_store.create_task(task, initial_state=AgentState.RECEIVED)
@@ -482,6 +533,19 @@ class AgentRuntime:
         self.current_plan = record.plan
         self.executed_actions = list(record.actions)
         self.observations = list(record.observations)
+
+        # Synchronize and restore domain configuration from persisted task metadata
+        try:
+            self._sync_domain_configuration(task)
+        except ValueError as e:
+            logger.error(f"[RESUME] Invalid domain in task metadata: {e}")
+            task.status = TaskStatus.FAILED
+            task.metadata["error"] = str(e)
+            self.memory_store.update_task_state(
+                task_id, state=AgentState.FAILED, status=TaskStatus.FAILED, metadata=task.metadata
+            )
+            self.set_state(AgentState.FAILED, status=TaskStatus.FAILED)
+            return task
 
         is_approved = task.metadata.get("approval_status") == "APPROVED"
 

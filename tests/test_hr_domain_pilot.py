@@ -615,5 +615,238 @@ class TestEndToEndHRWorkflowExecution(unittest.TestCase):
         asyncio.run(run_scenario())
 
 
+class TestResumeDomainSynchronization(unittest.TestCase):
+    """Regression tests verifying domain synchronization during direct task resume."""
+
+    def setUp(self):
+        self.mem_store = SQLiteMemoryStore(":memory:")
+        runtime_manager.memory_store = self.mem_store
+        runtime_manager.runtimes.clear()
+        runtime_manager.background_tasks.clear()
+        self.mock_llm = MockDeterministicLLM(
+            initial_plan={"is_feasible": True, "actions": []},
+            step_responses=[
+                {"is_complete": True, "completion_summary": "Task complete.", "action": None}
+            ],
+        )
+        self.client = TestClient(app)
+
+    def tearDown(self):
+        self.mem_store.close()
+        runtime_manager.memory_store = SQLiteMemoryStore()
+        runtime_manager.runtimes.clear()
+        runtime_manager.background_tasks.clear()
+
+    def test_direct_resume_hr_task_restores_domain_and_guidelines_and_verifier(self):
+        """Directly resuming an HR task restores HR domain, planner guidelines, and HR verifier."""
+        task = Task(
+            task_id="task-resume-hr-001",
+            user_goal="Process employee onboarding for HR-TEST-1001",
+            metadata={"domain": "hr", "source_document": "onboarding_hr_test_1001.txt"},
+        )
+        self.mem_store.create_task(task, initial_state=AgentState.ADAPTING)
+
+        # Create an unconfigured runtime without domain
+        runtime = AgentRuntime(memory_store=self.mem_store, llm_provider=self.mock_llm)
+        self.assertIsNone(runtime.domain)
+        # Default planner starts with finance guidelines
+        self.assertEqual(runtime.planner.domain_guidelines, DEFAULT_FINANCE_GUIDELINES)
+
+        # Directly resume task
+        resumed = asyncio.run(runtime.resume_task(task.task_id))
+
+        # Domain must now be synchronized
+        self.assertEqual(runtime.domain, "hr")
+        self.assertEqual(resumed.metadata.get("domain"), "hr")
+        self.assertEqual(runtime.planner.domain_guidelines, DEFAULT_HR_GUIDELINES)
+        self.assertTrue(
+            any(isinstance(v, HROnboardingVerifier) for v in runtime.verifier_registry.verifiers)
+        )
+        # HR guidelines are used without finance cross-contamination
+        for rule in DEFAULT_HR_GUIDELINES:
+            self.assertIn(rule, runtime.planner.domain_guidelines)
+        for rule in DEFAULT_FINANCE_GUIDELINES:
+            self.assertNotIn(rule, runtime.planner.domain_guidelines)
+
+    def test_direct_resume_finance_task_restores_finance_behavior(self):
+        """Directly resuming a Finance task retains Finance domain, guidelines, and verifier."""
+        task = Task(
+            task_id="task-resume-fin-002",
+            user_goal="Process invoice INV-2026-0001",
+            metadata={"domain": "finance", "source_document": "invoice_acme_1001.txt"},
+        )
+        self.mem_store.create_task(task, initial_state=AgentState.ADAPTING)
+
+        runtime = AgentRuntime(memory_store=self.mem_store, llm_provider=self.mock_llm)
+        resumed = asyncio.run(runtime.resume_task(task.task_id))
+
+        self.assertEqual(runtime.domain, "finance")
+        self.assertEqual(resumed.metadata.get("domain"), "finance")
+        self.assertEqual(runtime.planner.domain_guidelines, DEFAULT_FINANCE_GUIDELINES)
+        self.assertIsNotNone(runtime.finance_verifier)
+
+    def test_direct_resume_missing_domain_metadata_defaults_to_finance(self):
+        """Missing domain metadata in persisted task preserves the backward-compatible Finance default."""
+        task = Task(
+            task_id="task-resume-legacy-003",
+            user_goal="Legacy task without domain metadata",
+            metadata={},
+        )
+        self.mem_store.create_task(task, initial_state=AgentState.ADAPTING)
+
+        runtime = AgentRuntime(memory_store=self.mem_store, llm_provider=self.mock_llm)
+        resumed = asyncio.run(runtime.resume_task(task.task_id))
+
+        self.assertEqual(runtime.domain, "finance")
+        self.assertEqual(resumed.metadata.get("domain"), "finance")
+        self.assertEqual(runtime.planner.domain_guidelines, DEFAULT_FINANCE_GUIDELINES)
+
+    def test_direct_resume_invalid_persisted_domain_fails_safely(self):
+        """Invalid or unknown persisted domain metadata causes resume to fail safely."""
+        task = Task(
+            task_id="task-resume-invalid-004",
+            user_goal="Task with invalid domain",
+            metadata={"domain": "unsupported_domain_xyz"},
+        )
+        self.mem_store.create_task(task, initial_state=AgentState.ADAPTING)
+
+        runtime = AgentRuntime(memory_store=self.mem_store, llm_provider=self.mock_llm)
+        resumed = asyncio.run(runtime.resume_task(task.task_id))
+
+        self.assertEqual(resumed.status, TaskStatus.FAILED)
+        self.assertEqual(runtime.state, AgentState.FAILED)
+        self.assertIn("Unsupported domain 'unsupported_domain_xyz'", resumed.metadata.get("error", ""))
+
+        # Verify persistent store state was updated to FAILED
+        persisted = self.mem_store.get_task(task.task_id)
+        self.assertEqual(persisted.task.status, TaskStatus.FAILED)
+        self.assertEqual(persisted.state, AgentState.FAILED)
+
+    def test_direct_resume_preserves_task_history_and_approval_state(self):
+        """Direct resume preserves action history, observation history, and approval status."""
+        task = Task(
+            task_id="task-resume-preserve-005",
+            user_goal="Verify state preservation during resume",
+            metadata={
+                "domain": "hr",
+                "approval_status": "APPROVED",
+                "approved_action_fingerprint": "mock-fp-123",
+            },
+        )
+        self.mem_store.create_task(task, initial_state=AgentState.WAITING_FOR_HUMAN)
+        act1 = Action(tool_name="read_company_file", arguments={"file_path": "test.txt"})
+        obs1 = Observation(action_id=act1.action_id, success=True, result="file content")
+        self.mem_store.append_action(task.task_id, act1)
+        self.mem_store.append_observation(task.task_id, obs1)
+
+        runtime = AgentRuntime(memory_store=self.mem_store, llm_provider=self.mock_llm)
+        resumed = asyncio.run(runtime.resume_task(task.task_id))
+
+        self.assertEqual(resumed.task_id, task.task_id)
+        self.assertEqual(resumed.metadata.get("domain"), "hr")
+        self.assertEqual(resumed.metadata.get("approval_status"), "APPROVED")
+        self.assertEqual(len(runtime.executed_actions), 1)
+        self.assertEqual(runtime.executed_actions[0].tool_name, "read_company_file")
+        self.assertEqual(len(runtime.observations), 1)
+
+    def test_existing_api_resume_endpoint_retains_behavior(self):
+        """FastAPI POST /api/tasks/{task_id}/resume retains full functionality."""
+        t = Task(
+            task_id="api-resume-task-006",
+            user_goal="API resume test",
+            metadata={"domain": "hr"},
+        )
+        self.mem_store.create_task(t, initial_state=AgentState.ADAPTING)
+
+        response = self.client.post(f"/api/tasks/{t.task_id}/resume")
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertEqual(data["task_id"], t.task_id)
+
+    def test_repeated_synchronization_does_not_duplicate_policy_rules_or_verifiers(self):
+        """Repeated synchronization of the same task does not duplicate policy rules or verifiers."""
+        task = Task(
+            task_id="task-resume-dup-007",
+            user_goal="Repeated sync test",
+            metadata={"domain": "hr"},
+        )
+        self.mem_store.create_task(task, initial_state=AgentState.ADAPTING)
+
+        runtime = AgentRuntime(memory_store=self.mem_store, llm_provider=self.mock_llm)
+        asyncio.run(runtime.resume_task(task.task_id))
+
+        rule_count_first = len(runtime.policy.domain_rules)
+        verifier_count_first = len(runtime.verifier_registry.verifiers)
+
+        # Call synchronization again
+        runtime._sync_domain_configuration(task)
+        runtime._sync_domain_configuration(task)
+
+        self.assertEqual(len(runtime.policy.domain_rules), rule_count_first)
+        self.assertEqual(len(runtime.verifier_registry.verifiers), verifier_count_first)
+
+    def test_runtime_reuse_across_domains_is_isolated_and_consistent(self):
+        """Reusing the same AgentRuntime across HR and Finance switches domain rules and guidelines consistently."""
+        from backend.policy.rules import DomainRiskRule
+        from backend.policy.risk import ActionRisk
+
+        custom_rule = DomainRiskRule(
+            name="custom_audit_preserve",
+            risk_level=ActionRisk.SENSITIVE,
+            tool_names={"audit_log"},
+        )
+        policy = DefaultActionPolicy(domain_rules=[custom_rule])
+
+        runtime = AgentRuntime(
+            memory_store=self.mem_store,
+            llm_provider=self.mock_llm,
+            policy=policy,
+        )
+
+        hr_task = Task(
+            task_id="hr-reuse-task",
+            user_goal="Process HR onboarding",
+            metadata={"domain": "hr"},
+        )
+        fin_task = Task(
+            task_id="fin-reuse-task",
+            user_goal="Process Finance invoice",
+            metadata={"domain": "finance"},
+        )
+        self.mem_store.create_task(hr_task, initial_state=AgentState.ADAPTING)
+        self.mem_store.create_task(fin_task, initial_state=AgentState.ADAPTING)
+
+        # 1. Run / resume HR task
+        asyncio.run(runtime.resume_task(hr_task.task_id))
+        self.assertEqual(runtime.domain, "hr")
+        self.assertEqual(runtime.planner.domain_guidelines, DEFAULT_HR_GUIDELINES)
+        hr_rule_names = {r.name for r in runtime.policy.domain_rules}
+        self.assertIn("hr_finalize_onboarding", hr_rule_names)
+        self.assertIn("custom_audit_preserve", hr_rule_names)
+        hr_verifier = runtime.verifier_registry.get_verifier(hr_task)
+        self.assertIsInstance(hr_verifier, HROnboardingVerifier)
+
+        # 2. Reuse same runtime for Finance task
+        asyncio.run(runtime.resume_task(fin_task.task_id))
+        self.assertEqual(runtime.domain, "finance")
+        self.assertEqual(runtime.planner.domain_guidelines, DEFAULT_FINANCE_GUIDELINES)
+        fin_rule_names = {r.name for r in runtime.policy.domain_rules}
+        # HR rules must not linger on Finance task
+        self.assertNotIn("hr_finalize_onboarding", fin_rule_names)
+        self.assertNotIn("hr_bulk_purge_destructive", fin_rule_names)
+        # Custom rule must still be preserved
+        self.assertIn("custom_audit_preserve", fin_rule_names)
+        fin_verifier = runtime.verifier_registry.get_verifier(fin_task)
+        self.assertIsInstance(fin_verifier, FinanceInvoiceVerifier)
+
+        # 3. Switch back to HR
+        asyncio.run(runtime.resume_task(hr_task.task_id))
+        self.assertEqual(runtime.domain, "hr")
+        self.assertEqual(runtime.planner.domain_guidelines, DEFAULT_HR_GUIDELINES)
+        hr_rule_names_again = {r.name for r in runtime.policy.domain_rules}
+        self.assertIn("hr_finalize_onboarding", hr_rule_names_again)
+        self.assertIn("custom_audit_preserve", hr_rule_names_again)
+
+
 if __name__ == "__main__":
     unittest.main()
