@@ -4,7 +4,9 @@ from pydantic import BaseModel, Field
 
 class CreateTaskRequest(BaseModel):
     user_goal: str = Field(..., min_length=1, description="Goal for AURA to achieve.")
+    domain: Optional[str] = Field(default="finance", description="Business domain ('finance' or 'hr'). Defaults to 'finance'.")
     metadata: Optional[Dict[str, Any]] = Field(default_factory=dict, description="Optional extra metadata.")
+
 
 
 class ApprovalRequest(BaseModel):

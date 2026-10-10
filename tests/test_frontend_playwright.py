@@ -28,9 +28,24 @@ class TestControlCenterPlaywright(unittest.IsolatedAsyncioTestCase):
             textarea = page.locator("#user-goal")
             self.assertTrue(await textarea.is_visible())
 
-            # Click example button
-            example_btn = page.locator("text=Insert Acme Invoice Example")
-            await example_btn.click()
+            # 3b. Verify Domain Selector
+            finance_pill = page.locator("#domain-select-finance")
+            hr_pill = page.locator("#domain-select-hr")
+            self.assertTrue(await finance_pill.is_visible())
+            self.assertTrue(await hr_pill.is_visible())
+
+            # Click HR pill and test HR example inserter
+            await hr_pill.click()
+            hr_example_btn = page.locator("#insert-example-btn")
+            self.assertTrue(await hr_example_btn.is_visible())
+            await hr_example_btn.click()
+
+            entered_val = await textarea.input_value()
+            self.assertIn("HR-TEST-1001", entered_val)
+
+            # Switch back to Finance and test invoice example
+            await finance_pill.click()
+            await hr_example_btn.click()
 
             entered_val = await textarea.input_value()
             self.assertIn("Acme", entered_val)

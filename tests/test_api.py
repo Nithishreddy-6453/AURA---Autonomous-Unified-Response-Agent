@@ -22,6 +22,9 @@ class TestControlCenterAPI(unittest.TestCase):
 
     def tearDown(self):
         self.mem_store.close()
+        runtime_manager.memory_store = SQLiteMemoryStore()
+        runtime_manager.runtimes.clear()
+        runtime_manager.background_tasks.clear()
 
     def test_health_check(self):
         response = self.client.get("/health")

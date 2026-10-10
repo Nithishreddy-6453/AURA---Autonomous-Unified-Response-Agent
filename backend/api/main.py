@@ -64,10 +64,19 @@ class RuntimeManager:
         self.runtimes: Dict[str, AgentRuntime] = {}
         self.background_tasks: Dict[str, asyncio.Task] = {}
 
-    def get_runtime_for_task(self, task_id: str) -> AgentRuntime:
+    def get_runtime_for_task(self, task_id: str, domain: Optional[str] = None) -> AgentRuntime:
         if task_id not in self.runtimes:
+            resolved_domain = domain
+            if not resolved_domain:
+                record = self.memory_store.get_task(task_id)
+                if record and isinstance(record.task.metadata, dict):
+                    resolved_domain = record.task.metadata.get("domain", "finance")
+                else:
+                    resolved_domain = "finance"
+
             runtime = AgentRuntime(
                 memory_store=self.memory_store,
+                domain=resolved_domain,
             )
             self.runtimes[task_id] = runtime
         return self.runtimes[task_id]
@@ -95,8 +104,22 @@ async def create_task(request: CreateTaskRequest):
             detail="User goal cannot be empty.",
         )
 
-    task = Task(user_goal=goal, metadata=request.metadata or {})
-    runtime = runtime_manager.get_runtime_for_task(task.task_id)
+    from backend.agent.domains import validate_domain
+    try:
+        domain = validate_domain(request.domain)
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e),
+        )
+
+    meta = dict(request.metadata or {})
+    meta["domain"] = domain
+    task = Task(user_goal=goal, metadata=meta)
+    try:
+        runtime = runtime_manager.get_runtime_for_task(task.task_id, domain=domain)
+    except TypeError:
+        runtime = runtime_manager.get_runtime_for_task(task.task_id)
 
     # Immediately persist initial record so queries never race
     runtime.memory_store.create_task(task, initial_state=AgentState.RECEIVED)

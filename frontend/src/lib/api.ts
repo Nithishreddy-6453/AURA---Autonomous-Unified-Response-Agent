@@ -11,11 +11,11 @@ export async function checkHealth(): Promise<boolean> {
   }
 }
 
-export async function createTask(user_goal: string): Promise<TaskSummary> {
+export async function createTask(user_goal: string, domain?: string): Promise<TaskSummary> {
   const res = await fetch(`${API_BASE}/api/tasks`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ user_goal }),
+    body: JSON.stringify({ user_goal, domain: domain || "finance" }),
   });
   if (!res.ok) {
     const errorData = await res.json().catch(() => ({}));
@@ -23,6 +23,7 @@ export async function createTask(user_goal: string): Promise<TaskSummary> {
   }
   return res.json();
 }
+
 
 export async function listTasks(limit = 20): Promise<TaskSummary[]> {
   const res = await fetch(`${API_BASE}/api/tasks?limit=${limit}`, {

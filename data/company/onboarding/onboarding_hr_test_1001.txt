@@ -1,0 +1,10 @@
+EMPLOYEE_ID: HR-TEST-1001
+NAME: Alex Morgan
+ROLE: Platform Engineer
+DEPARTMENT: Engineering
+START_DATE: 2026-04-01
+STATUS: PENDING
+CHECKLIST:
+  - Security Background Check: COMPLETE
+  - Laptop Provisioning: COMPLETE
+  - System Access: COMPLETE

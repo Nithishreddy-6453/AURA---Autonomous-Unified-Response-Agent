@@ -64,10 +64,17 @@ class VerifierRegistry:
         return None
 
 
-def get_default_verifier_registry() -> VerifierRegistry:
-    """Creates a VerifierRegistry pre-configured with the default FinanceInvoiceVerifier."""
+def get_default_verifier_registry(domain: Optional[str] = None) -> VerifierRegistry:
+    """Creates a VerifierRegistry pre-configured with default domain verifiers.
+
+    Defaults to Finance verifier for backward compatibility with existing tests and callers.
+    Registers HROnboardingVerifier if domain is 'hr' or 'all'.
+    """
     from backend.verification.finance_verifier import FinanceInvoiceVerifier
 
     registry = VerifierRegistry()
     registry.register(FinanceInvoiceVerifier())
+    if domain in ("hr", "all"):
+        from backend.verification.hr_verifier import HROnboardingVerifier
+        registry.register(HROnboardingVerifier())
     return registry

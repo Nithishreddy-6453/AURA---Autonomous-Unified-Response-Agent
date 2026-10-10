@@ -40,6 +40,7 @@ class TestE2EApiFlow(unittest.TestCase):
     """End-to-End API test verifying task creation, polling, approval, and completion."""
 
     def setUp(self):
+        self._orig_get_runtime = runtime_manager.get_runtime_for_task
         self.mem_store = SQLiteMemoryStore(":memory:")
         runtime_manager.memory_store = self.mem_store
         runtime_manager.runtimes.clear()
@@ -48,6 +49,9 @@ class TestE2EApiFlow(unittest.TestCase):
 
     def tearDown(self):
         self.mem_store.close()
+        runtime_manager.get_runtime_for_task = self._orig_get_runtime
+        runtime_manager.memory_store = SQLiteMemoryStore()
+        runtime_manager.runtimes.clear()
 
     def test_human_approval_lifecycle_via_api(self):
         """Tests: POST /api/tasks -> WAITING_FOR_HUMAN -> POST /api/tasks/{id}/approve -> COMPLETED."""

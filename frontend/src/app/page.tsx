@@ -121,11 +121,11 @@ export default function ControlCenterPage() {
   }, [activeTaskId, loadTaskData, refreshTasksList]);
 
   // Handle task submission
-  const handleRunTask = async (goal: string) => {
+  const handleRunTask = async (goal: string, domain?: string) => {
     setIsSubmitting(true);
     setErrorMessage(null);
     try {
-      const created = await createTask(goal);
+      const created = await createTask(goal, domain);
       setActiveTaskId(created.task_id);
       await refreshTasksList();
     } catch (err: any) {

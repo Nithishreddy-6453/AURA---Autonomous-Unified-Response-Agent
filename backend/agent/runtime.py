@@ -62,11 +62,21 @@ class AgentRuntime:
         verifier_registry: Optional[VerifierRegistry] = None,
         domain_guidelines: Optional[Sequence[str]] = None,
         domain_rules: Optional[Sequence[DomainRiskRule]] = None,
+        domain: Optional[str] = None,
         on_state_change: Optional[Callable[[AgentState, Task], None]] = None,
         on_action: Optional[Callable[[Action], None]] = None,
         on_observation: Optional[Callable[[Action, Observation], None]] = None,
         max_dynamic_steps: int = 15,
     ) -> None:
+        self.domain = domain
+        if domain:
+            from backend.agent.domains import get_domain_config
+            cfg = get_domain_config(domain)
+            if domain_guidelines is None:
+                domain_guidelines = list(cfg.guidelines)
+            if domain_rules is None and cfg.policy_rules:
+                domain_rules = list(cfg.policy_rules)
+
         self.llm = llm_provider or get_llm_provider()
         self.tool_registry = tool_registry or get_default_tool_registry()
         self.planner = planner or Planner(
@@ -83,8 +93,13 @@ class AgentRuntime:
         else:
             self.policy = DefaultActionPolicy(domain_rules=domain_rules)
         self.verifier_registry: VerifierRegistry = (
-            verifier_registry if verifier_registry is not None else get_default_verifier_registry()
+            verifier_registry if verifier_registry is not None else get_default_verifier_registry(domain=self.domain)
         )
+        if self.domain == "hr":
+            from backend.verification.hr_verifier import HROnboardingVerifier
+            if not any(isinstance(v, HROnboardingVerifier) for v in self.verifier_registry.verifiers):
+                self.verifier_registry.register(HROnboardingVerifier())
+
 
         self.state: AgentState = AgentState.RECEIVED
         self.on_state_change = on_state_change
@@ -176,8 +191,25 @@ class AgentRuntime:
         self.observations.clear()
         self.executed_actions.clear()
 
+        # Set or preserve domain in metadata
+        if self.domain and "domain" not in task.metadata:
+            task.metadata["domain"] = self.domain
+        elif task.metadata.get("domain") and not self.domain:
+            self.domain = task.metadata["domain"]
+            from backend.agent.domains import get_domain_config
+            cfg = get_domain_config(self.domain)
+            if hasattr(self.planner, "domain_guidelines"):
+                self.planner.domain_guidelines = list(cfg.guidelines)
+            if cfg.policy_rules and hasattr(self.policy, "register_rules"):
+                self.policy.register_rules(cfg.policy_rules)
+            if self.domain == "hr":
+                from backend.verification.hr_verifier import HROnboardingVerifier
+                if not any(isinstance(v, HROnboardingVerifier) for v in self.verifier_registry.verifiers):
+                    self.verifier_registry.register(HROnboardingVerifier())
+
         # Persist task creation
         self.memory_store.create_task(task, initial_state=AgentState.RECEIVED)
+
         logger.info(f"[TASK] created {task.task_id}")
         self._record_event(task.task_id, "TASK_CREATED", "Task created", {"user_goal": task.user_goal})
         self.set_state(AgentState.RECEIVED)
@@ -582,10 +614,11 @@ class AgentRuntime:
                     for act in self.executed_actions:
                         if act.tool_name in ("read_company_file", "document_extract"):
                             fp = act.arguments.get("file_path", "")
-                            if fp and ("invoice" in fp.lower() or fp.endswith(".txt")):
+                            if fp and ("invoice" in fp.lower() or "onboarding" in fp.lower() or fp.endswith(".txt")):
                                 source_ref = fp
                                 task.metadata["source_document"] = fp
                                 break
+
 
                 verifier = self.verifier_registry.get_verifier(task)
                 if verifier is not None:

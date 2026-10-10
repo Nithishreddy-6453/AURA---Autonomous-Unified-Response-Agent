@@ -94,12 +94,19 @@ class FinanceInvoiceVerifier(BaseVerifier):
         """Determines whether this verifier should handle the task.
 
         Matches if:
-        1. The task metadata specifies a source document/file/reference, OR
-        2. The task user goal contains both 'invoice' and 'finance' (case-insensitive).
+        1. Explicit domain is 'finance' (or absent/legacy default), AND
+        2. The task metadata specifies a source document/file/reference, OR
+        3. The task user goal contains both 'invoice' and 'finance' (case-insensitive).
+
+        Rejects any task whose explicit domain is not 'finance'.
         """
         if not task:
             return False
         meta = task.metadata if isinstance(task.metadata, dict) else {}
+        domain = meta.get("domain")
+        if domain and str(domain).strip().lower() != "finance":
+            return False
+
         source_ref = (
             meta.get("source_document")
             or meta.get("source_file")
@@ -271,6 +278,10 @@ class LegacyFinanceVerifierAdapter(BaseVerifier):
         if not task:
             return False
         meta = task.metadata if isinstance(task.metadata, dict) else {}
+        domain = meta.get("domain")
+        if domain and str(domain).strip().lower() != "finance":
+            return False
+
         source_ref = (
             meta.get("source_document")
             or meta.get("source_file")
@@ -281,6 +292,7 @@ class LegacyFinanceVerifierAdapter(BaseVerifier):
             return True
         goal = (task.user_goal or "").lower()
         return "invoice" in goal and "finance" in goal
+
 
     async def verify(
         self,
