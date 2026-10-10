@@ -1,6 +1,6 @@
 import json
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 from backend.agent.schemas import (
     NextActionResponseSchema,
@@ -18,14 +18,14 @@ from backend.tools.registry import ToolRegistry
 logger = logging.getLogger(__name__)
 
 
-PLANNER_SYSTEM_PROMPT = """You are AURA Planner, an autonomous reasoning and task decomposition engine.
+GENERIC_PLANNER_SYSTEM_PROMPT = """You are AURA Planner, an autonomous reasoning and task decomposition engine.
 Your role is to analyze a user goal and create an initial plan using ONLY the provided tools.
 
 STRICT RULES:
 1. You may ONLY choose tool names from the provided Available Tools list.
 2. You must NOT invent, guess, hallucinate, or alter any tool names.
 3. If information must first be discovered (e.g. searching company files to identify files or navigating to a portal), plan ONLY the initial concrete action (e.g. search_company_files). Do NOT guess future arguments or use template placeholders like '{{...}}'.
-4. Every argument in every planned action MUST be an actual, concrete value known right now (e.g. {"query": "Acme invoice", "category": "invoices"}). Never output placeholders or ungrounded filenames.
+4. Every argument in every planned action MUST be an actual, concrete value known right now. Never output placeholders or ungrounded filenames.
 5. If the user task requires an action or capability for which NO tool is listed, set "is_feasible": false and explain in "unsupported_reason".
 6. Output MUST be strictly valid JSON conforming to the following schema:
 {
@@ -42,7 +42,7 @@ STRICT RULES:
 7. Do not include markdown codeblocks or any additional conversational commentary. Output raw JSON only.
 """
 
-NEXT_ACTION_SYSTEM_PROMPT = """You are AURA Step Reasoner, an autonomous task execution engine.
+GENERIC_NEXT_ACTION_SYSTEM_PROMPT = """You are AURA Step Reasoner, an autonomous task execution engine.
 Given the User Goal, the Available Tools, and the History of executed Actions and their Observations, determine the single NEXT action to perform.
 
 STRICT RULES:
@@ -50,13 +50,10 @@ STRICT RULES:
 2. If the goal has been fully accomplished, set "is_complete": true, provide "completion_summary", and set "action": null.
 3. If human intervention is required (e.g. clarification needed, missing credentials, approval required), set "needs_human": true, explain in "reasoning", and set "action": null.
 4. If the goal is not yet complete, specify the exact next "action" with "tool_name" and "arguments" adhering to the tool schema.
-5. Ground your arguments in the actual observations returned from prior steps:
-   - When choosing which invoice file is latest, compare dates and filenames returned in observations.
-   - Use the exact extracted invoice ID, date, amount, due date from read_company_file or document_extract observations.
-   - For browser navigation, use the allowed portal URL (e.g. 'http://localhost:3000/finance/invoices/new').
-   - For browser typing, use valid targets like 'invoice_id', 'company', 'amount', 'due_date', 'invoice_date', etc.
-   - For submitting, click the submit button (e.g. text='Save Invoice' or selector='#submit-invoice-button').
-   - Take a screenshot as evidence before marking completion.
+5. Ground your arguments strictly in actual observations returned from prior steps:
+   - Read source documents before using their contents.
+   - Use concrete values discovered in previous observations rather than guessing or using placeholders.
+   - Verify or observe the outcome before declaring completion.
 6. Do NOT repeat failed or identical actions without changing arguments. If a previous action failed with an error, perform the corrective action (such as typing the missing required field or correcting the format).
 7. Output MUST be strictly valid JSON conforming to the schema:
 {
@@ -72,13 +69,54 @@ STRICT RULES:
 8. Do not include markdown codeblocks or any extra commentary. Output raw JSON only.
 """
 
+DEFAULT_FINANCE_GUIDELINES: List[str] = [
+    "When choosing which invoice file is latest, compare dates and filenames returned in observations.",
+    "Use the exact extracted invoice ID, date, amount, due date from read_company_file or document_extract observations.",
+    "For browser navigation, use the allowed portal URL (e.g. 'http://localhost:3000/finance/invoices/new').",
+    "For browser typing, use valid targets like 'invoice_id', 'company', 'amount', 'due_date', 'invoice_date', etc.",
+    "For submitting, click the submit button (e.g. text='Save Invoice' or selector='#submit-invoice-button').",
+    "Take a screenshot as evidence before marking completion.",
+]
+
+# Backward compatibility aliases
+PLANNER_SYSTEM_PROMPT = GENERIC_PLANNER_SYSTEM_PROMPT
+NEXT_ACTION_SYSTEM_PROMPT = GENERIC_NEXT_ACTION_SYSTEM_PROMPT
+
 
 class Planner:
     """Uses LLM to formulate an actionable plan and dynamically determine subsequent actions."""
 
-    def __init__(self, llm_provider: LLMProvider, tool_registry: ToolRegistry) -> None:
+    def __init__(
+        self,
+        llm_provider: LLMProvider,
+        tool_registry: ToolRegistry,
+        domain_guidelines: Optional[Sequence[str]] = None,
+    ) -> None:
         self.llm = llm_provider
         self.tool_registry = tool_registry
+        if domain_guidelines is None:
+            self.domain_guidelines: List[str] = list(DEFAULT_FINANCE_GUIDELINES)
+        else:
+            self.domain_guidelines = [str(g).strip() for g in domain_guidelines if str(g).strip()]
+
+    def get_effective_planner_system_prompt(self) -> str:
+        """Constructs the system prompt for initial plan creation with active domain guidelines."""
+        if not self.domain_guidelines:
+            return GENERIC_PLANNER_SYSTEM_PROMPT
+        guidelines_section = "\n\nDOMAIN GUIDELINES:\n" + "\n".join(
+            f"- {g}" for g in self.domain_guidelines
+        )
+        return f"{GENERIC_PLANNER_SYSTEM_PROMPT.strip()}{guidelines_section}\n"
+
+    def get_effective_next_action_system_prompt(self) -> str:
+        """Constructs the system prompt for dynamic next-action reasoning with active domain guidelines."""
+        if not self.domain_guidelines:
+            return GENERIC_NEXT_ACTION_SYSTEM_PROMPT
+        guidelines_section = "\n\nDOMAIN GUIDELINES:\n" + "\n".join(
+            f"- {g}" for g in self.domain_guidelines
+        )
+        return f"{GENERIC_NEXT_ACTION_SYSTEM_PROMPT.strip()}{guidelines_section}\n"
+
 
     async def create_plan(self, task: Task) -> PlanningResult:
         """Formulate an initial Plan for the given Task or return a structured failure."""
@@ -93,9 +131,10 @@ class Planner:
         try:
             raw_response = await self.llm.generate(
                 prompt=user_content,
-                system_instruction=PLANNER_SYSTEM_PROMPT,
+                system_instruction=self.get_effective_planner_system_prompt(),
                 temperature=0.0,
             )
+
         except Exception as e:
             logger.error(f"Planner LLM generation error: {e}")
             return PlanningResult(
@@ -226,9 +265,10 @@ class Planner:
         try:
             raw_response = await self.llm.generate(
                 prompt=user_content,
-                system_instruction=NEXT_ACTION_SYSTEM_PROMPT,
+                system_instruction=self.get_effective_next_action_system_prompt(),
                 temperature=0.0,
             )
+
         except Exception as e:
             return NextActionResponseSchema(
                 is_complete=False,

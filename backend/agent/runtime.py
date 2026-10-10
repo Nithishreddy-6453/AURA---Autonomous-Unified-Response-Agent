@@ -1,6 +1,6 @@
 import logging
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from backend.agent.planner import Planner
 from backend.agent.state import AgentState
@@ -59,6 +59,7 @@ class AgentRuntime:
         memory_store: Optional[MemoryStore] = None,
         policy: Optional[ActionPolicy] = None,
         verifier_registry: Optional[VerifierRegistry] = None,
+        domain_guidelines: Optional[Sequence[str]] = None,
         on_state_change: Optional[Callable[[AgentState, Task], None]] = None,
         on_action: Optional[Callable[[Action], None]] = None,
         on_observation: Optional[Callable[[Action, Observation], None]] = None,
@@ -69,7 +70,9 @@ class AgentRuntime:
         self.planner = planner or Planner(
             llm_provider=self.llm,
             tool_registry=self.tool_registry,
+            domain_guidelines=domain_guidelines,
         )
+
         self.memory_store: MemoryStore = memory_store or SQLiteMemoryStore()
         self.policy: ActionPolicy = policy or DefaultActionPolicy()
         self.verifier_registry: VerifierRegistry = (
