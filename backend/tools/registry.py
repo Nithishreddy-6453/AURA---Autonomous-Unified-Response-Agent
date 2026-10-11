@@ -1,4 +1,5 @@
-from typing import Dict, List
+import asyncio
+from typing import Any, Dict, List
 from backend.tools.base import Tool
 
 
@@ -42,3 +43,31 @@ class ToolRegistry:
                 "input_schema": tool.input_schema,
             })
         return specs
+
+    def get_browser_sessions(self) -> List[Any]:
+        """Returns all distinct BrowserSession instances held by registered tools."""
+        sessions = []
+        for tool in self._tools.values():
+            session = getattr(tool, "session", None)
+            if session is not None and hasattr(session, "close"):
+                if session not in sessions:
+                    sessions.append(session)
+        return sessions
+
+    async def close(self) -> None:
+        """Closes all active resources managed by registered tools."""
+        for session in self.get_browser_sessions():
+            try:
+                res = session.close()
+                if asyncio.iscoroutine(res):
+                    await res
+            except Exception:
+                pass
+        for tool in self._tools.values():
+            if hasattr(tool, "close") and callable(tool.close):
+                try:
+                    res = tool.close()
+                    if asyncio.iscoroutine(res):
+                        await res
+                except Exception:
+                    pass

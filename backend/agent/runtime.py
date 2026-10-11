@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence
@@ -141,6 +142,39 @@ class AgentRuntime:
         if not replaced:
             self.verifier_registry.register(replacement)
 
+    async def close_browser_sessions(self) -> None:
+        """Safely closes any active Playwright browser sessions managed by registered tools."""
+        if hasattr(self.tool_registry, "close") and callable(self.tool_registry.close):
+            res = self.tool_registry.close()
+            if asyncio.iscoroutine(res):
+                await res
+            return
+
+        sessions = []
+        for tool in self.tool_registry.list_tools():
+            session = getattr(tool, "session", None)
+            if session is not None and hasattr(session, "close") and callable(session.close):
+                if session not in sessions:
+                    sessions.append(session)
+        for s in sessions:
+            try:
+                res = s.close()
+                if asyncio.iscoroutine(res):
+                    await res
+            except Exception as e:
+                logger.warning(f"Error closing browser session: {e}")
+
+    async def close(self) -> None:
+        """Closes all runtime-managed resources including browser sessions."""
+        await self.close_browser_sessions()
+
+    async def __aenter__(self) -> "AgentRuntime":
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
+        await self.close()
+
+
 
 
 
@@ -243,7 +277,20 @@ class AgentRuntime:
 
     async def execute_task(self, task: Task, use_dynamic_adaptation: bool = True) -> Task:
         """Runs the orchestrator through the adaptive task lifecycle with memory persistence."""
+        try:
+            return await self._execute_task_internal(task, use_dynamic_adaptation=use_dynamic_adaptation)
+        except (Exception, asyncio.CancelledError):
+            await self.close_browser_sessions()
+            raise
+        finally:
+            status = getattr(self.current_task, "status", None) or getattr(task, "status", None)
+            if status in (TaskStatus.COMPLETED, TaskStatus.FAILED):
+                await self.close_browser_sessions()
+
+    async def _execute_task_internal(self, task: Task, use_dynamic_adaptation: bool = True) -> Task:
+        """Internal execution loop logic."""
         self.current_task = task
+
         self.observations.clear()
         self.executed_actions.clear()
 
@@ -449,7 +496,14 @@ class AgentRuntime:
             f"Human rejected action. Reason: {reason or 'No reason provided'}",
             {"reason": reason},
         )
+        try:
+            loop = asyncio.get_running_loop()
+            if loop.is_running():
+                loop.create_task(self.close_browser_sessions())
+        except RuntimeError:
+            pass
         return task
+
 
     def get_task_events(self, task_id: str, limit: int = 50) -> List[Dict[str, Any]]:
         """Returns bounded structured chronological operational events for a task."""
@@ -522,7 +576,20 @@ class AgentRuntime:
 
     async def resume_task(self, task_id: str) -> Task:
         """Resumes a previously persisted task from its stored state in MemoryStore."""
+        try:
+            return await self._resume_task_internal(task_id)
+        except (Exception, asyncio.CancelledError):
+            await self.close_browser_sessions()
+            raise
+        finally:
+            status = getattr(self.current_task, "status", None)
+            if status in (TaskStatus.COMPLETED, TaskStatus.FAILED):
+                await self.close_browser_sessions()
+
+    async def _resume_task_internal(self, task_id: str) -> Task:
+        """Internal task resume logic."""
         record = self.memory_store.get_task(task_id)
+
         if not record:
             raise KeyError(f"Task '{task_id}' not found in memory store.")
 

@@ -2,15 +2,22 @@ import asyncio
 import os
 import unittest
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
 
-from backend.tools.browser.browser_session import BrowserSession
+from backend.agent.planner import Planner
+from backend.agent.runtime import AgentRuntime
+from backend.agent.schemas import NextActionResponseSchema, PlanActionSchema, PlanningResult
+from backend.agent.state import AgentState
+from backend.memory.sqlite_store import SQLiteMemoryStore
+from backend.models.observation import Observation
+from backend.models.task import Task, TaskStatus
+from backend.tools import get_default_tool_registry
+from backend.tools.browser.browser_click import BrowserClickTool
 from backend.tools.browser.browser_navigate import BrowserNavigateTool, is_url_allowed
 from backend.tools.browser.browser_read import BrowserReadTool
-from backend.tools.browser.browser_click import BrowserClickTool
-from backend.tools.browser.browser_type import BrowserTypeTool
 from backend.tools.browser.browser_screenshot import BrowserScreenshotTool
-from backend.tools import get_default_tool_registry
-from backend.models.observation import Observation
+from backend.tools.browser.browser_session import BrowserSession
+from backend.tools.browser.browser_type import BrowserTypeTool
 
 
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "test_page.html"
@@ -208,6 +215,230 @@ class TestBrowserLayer(unittest.TestCase):
         spec_names = [s["name"] for s in specs]
         for name in expected:
             self.assertIn(name, spec_names)
+
+    def test_successful_browser_task_closes_resources(self):
+        """Test that a successfully completed task automatically closes browser sessions."""
+        async def run_test():
+            session = BrowserSession(headless=True)
+            tool_reg = get_default_tool_registry(browser_session=session)
+
+            mock_planner = MagicMock(spec=Planner)
+            mock_planner.create_plan = AsyncMock(
+                return_value=PlanningResult(
+                    success=True,
+                    plan_id="plan-success",
+                    goal="Navigate to local test page",
+                    actions=[PlanActionSchema(tool_name="browser_navigate", arguments={"url": LOCAL_TEST_URL})],
+                )
+            )
+            mock_planner.decide_next_action = AsyncMock(
+                return_value=NextActionResponseSchema(
+                    is_complete=True,
+                    completion_summary="Page loaded successfully",
+                    reasoning="Complete",
+                )
+            )
+
+            mem_store = SQLiteMemoryStore(":memory:")
+            runtime = AgentRuntime(
+                tool_registry=tool_reg,
+                planner=mock_planner,
+                memory_store=mem_store,
+            )
+
+            task = Task(user_goal="Navigate and complete")
+            result = await runtime.execute_task(task, use_dynamic_adaptation=True)
+
+            self.assertEqual(result.status, TaskStatus.COMPLETED)
+            self.assertEqual(runtime.state, AgentState.COMPLETED)
+            # Browser session and Chromium process must be safely closed
+            self.assertFalse(session.is_active)
+            self.assertFalse(session.has_active_browser)
+            self.assertIsNone(session._page)
+            self.assertIsNone(session._browser)
+            mem_store.close()
+
+        asyncio.run(run_test())
+
+    def test_failed_browser_task_closes_resources(self):
+        """Test that a task ending in FAILED status automatically closes browser sessions."""
+        async def run_test():
+            session = BrowserSession(headless=True)
+            tool_reg = get_default_tool_registry(browser_session=session)
+
+            # Open a page first so browser process is active
+            await session.get_page()
+            self.assertTrue(session.is_active)
+            self.assertTrue(session.has_active_browser)
+
+            mock_planner = MagicMock(spec=Planner)
+            mock_planner.create_plan = AsyncMock(
+                return_value=PlanningResult(
+                    success=False,
+                    error="Unrecoverable planning failure",
+                )
+            )
+
+            mem_store = SQLiteMemoryStore(":memory:")
+            runtime = AgentRuntime(
+                tool_registry=tool_reg,
+                planner=mock_planner,
+                memory_store=mem_store,
+            )
+
+            task = Task(user_goal="Should fail during planning")
+            result = await runtime.execute_task(task, use_dynamic_adaptation=True)
+
+            self.assertEqual(result.status, TaskStatus.FAILED)
+            self.assertEqual(runtime.state, AgentState.FAILED)
+            self.assertFalse(session.is_active)
+            self.assertFalse(session.has_active_browser)
+            self.assertIsNone(session._page)
+            self.assertIsNone(session._browser)
+            mem_store.close()
+
+        asyncio.run(run_test())
+
+    def test_exception_closes_resources(self):
+        """Test that an unhandled exception during task execution guarantees browser teardown."""
+        async def run_test():
+            session = BrowserSession(headless=True)
+            tool_reg = get_default_tool_registry(browser_session=session)
+
+            await session.get_page()
+            self.assertTrue(session.is_active)
+
+            mock_planner = MagicMock(spec=Planner)
+            mock_planner.create_plan = AsyncMock(side_effect=RuntimeError("Simulated unhandled planner crash"))
+
+            mem_store = SQLiteMemoryStore(":memory:")
+            runtime = AgentRuntime(
+                tool_registry=tool_reg,
+                planner=mock_planner,
+                memory_store=mem_store,
+            )
+
+            task = Task(user_goal="Will raise unhandled exception")
+            with self.assertRaises(RuntimeError):
+                await runtime.execute_task(task, use_dynamic_adaptation=True)
+
+            self.assertFalse(session.is_active)
+            self.assertFalse(session.has_active_browser)
+            self.assertIsNone(session._page)
+            self.assertIsNone(session._browser)
+            mem_store.close()
+
+        asyncio.run(run_test())
+
+    def test_cancellation_closes_resources(self):
+        """Test that asyncio task cancellation guarantees browser teardown."""
+        async def run_test():
+            session = BrowserSession(headless=True)
+            tool_reg = get_default_tool_registry(browser_session=session)
+
+            async def slow_create_plan(t):
+                # Ensure page is launched before cancellation
+                await session.get_page()
+                await asyncio.sleep(5)
+                return PlanningResult(success=True)
+
+            mock_planner = MagicMock(spec=Planner)
+            mock_planner.create_plan = slow_create_plan
+
+            mem_store = SQLiteMemoryStore(":memory:")
+            runtime = AgentRuntime(
+                tool_registry=tool_reg,
+                planner=mock_planner,
+                memory_store=mem_store,
+            )
+
+            task = Task(user_goal="Task to cancel")
+            async_job = asyncio.create_task(runtime.execute_task(task, use_dynamic_adaptation=True))
+
+            # Wait briefly for browser initialization
+            while not session.has_active_browser:
+                await asyncio.sleep(0.05)
+
+            self.assertTrue(session.has_active_browser)
+
+            # Cancel the task
+            async_job.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await async_job
+
+            self.assertFalse(session.is_active)
+            self.assertFalse(session.has_active_browser)
+            self.assertIsNone(session._page)
+            self.assertIsNone(session._browser)
+            mem_store.close()
+
+        asyncio.run(run_test())
+
+    def test_multiple_tasks_do_not_leak_sessions(self):
+        """Test that executing multiple sequential browser tasks does not leak browser sessions."""
+        async def run_test():
+            session = BrowserSession(headless=True)
+            tool_reg = get_default_tool_registry(browser_session=session)
+
+            mem_store = SQLiteMemoryStore(":memory:")
+            for i in range(3):
+                mock_planner = MagicMock(spec=Planner)
+                mock_planner.create_plan = AsyncMock(
+                    return_value=PlanningResult(
+                        success=True,
+                        plan_id=f"plan-{i}",
+                        goal=f"Task {i}",
+                        actions=[PlanActionSchema(tool_name="browser_navigate", arguments={"url": LOCAL_TEST_URL})],
+                    )
+                )
+                mock_planner.decide_next_action = AsyncMock(
+                    return_value=NextActionResponseSchema(
+                        is_complete=True,
+                        completion_summary=f"Task {i} complete",
+                    )
+                )
+
+                runtime = AgentRuntime(
+                    tool_registry=tool_reg,
+                    planner=mock_planner,
+                    memory_store=mem_store,
+                )
+
+                task = Task(user_goal=f"Batch task {i}")
+                res = await runtime.execute_task(task, use_dynamic_adaptation=True)
+                self.assertEqual(res.status, TaskStatus.COMPLETED)
+                # Session must be closed after each run
+                self.assertFalse(session.is_active)
+                self.assertFalse(session.has_active_browser)
+            mem_store.close()
+
+
+        asyncio.run(run_test())
+
+    def test_safe_closure_when_components_throw(self):
+        """Test that browser.close() and context.close() execute safely even when components raise exceptions."""
+        async def run_test():
+            session = BrowserSession(headless=True)
+            await session.get_page()
+            self.assertTrue(session.is_active)
+
+            # Inject a throwing close on page and context
+            real_page = session._page
+            real_context = session._context
+            real_page.close = AsyncMock(side_effect=Exception("Simulated page.close failure"))
+            real_context.close = AsyncMock(side_effect=Exception("Simulated context.close failure"))
+
+            # Calling close() must not raise and must still clean up browser and playwright
+            await session.close()
+
+            self.assertFalse(session.is_active)
+            self.assertFalse(session.has_active_browser)
+            self.assertIsNone(session._page)
+            self.assertIsNone(session._context)
+            self.assertIsNone(session._browser)
+            self.assertIsNone(session._playwright)
+
+        asyncio.run(run_test())
 
 
 if __name__ == "__main__":

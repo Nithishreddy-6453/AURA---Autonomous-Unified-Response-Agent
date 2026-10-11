@@ -130,3 +130,8 @@ class BrowserReadTool(Tool):
                 success=False,
                 error=f"Error reading page state: {str(e)}",
             )
+
+    async def close(self) -> None:
+        """Safely closes the underlying browser session."""
+        if self.session:
+            await self.session.close()

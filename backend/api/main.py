@@ -136,8 +136,12 @@ async def create_task(request: CreateTaskRequest):
         except Exception as e:
             logger.exception(f"Background task execution failed: {e}")
             runtime.set_state(AgentState.FAILED, status=TaskStatus.FAILED)
+        finally:
+            if runtime.current_task and runtime.current_task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED):
+                await runtime.close_browser_sessions()
 
     bg = asyncio.create_task(_run())
+
     runtime_manager.background_tasks[task.task_id] = bg
 
     return TaskSummary(
@@ -264,6 +268,9 @@ async def approve_task(task_id: str, request: Optional[ApprovalRequest] = None):
         except Exception as e:
             logger.exception(f"Background resume execution failed: {e}")
             runtime.set_state(AgentState.FAILED, status=TaskStatus.FAILED)
+        finally:
+            if runtime.current_task and runtime.current_task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED):
+                await runtime.close_browser_sessions()
 
     bg = asyncio.create_task(_resume())
     runtime_manager.background_tasks[task_id] = bg
@@ -293,6 +300,7 @@ async def reject_task(task_id: str, request: Optional[RejectRequest] = None):
 
     try:
         updated_task = runtime.reject_task(task_id, reason=reason)
+        await runtime.close_browser_sessions()
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -327,9 +335,13 @@ async def resume_task(task_id: str):
         except Exception as e:
             logger.exception(f"Background resume execution failed: {e}")
             runtime.set_state(AgentState.FAILED, status=TaskStatus.FAILED)
+        finally:
+            if runtime.current_task and runtime.current_task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED):
+                await runtime.close_browser_sessions()
 
     bg = asyncio.create_task(_resume())
     runtime_manager.background_tasks[task_id] = bg
+
 
     return TaskSummary(
         task_id=record.task.task_id,

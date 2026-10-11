@@ -57,3 +57,7 @@ class Tool(ABC):
     async def execute(self, **kwargs: Any) -> Observation:
         """Execute the tool action and return an Observation."""
         pass
+
+    async def close(self) -> None:
+        """Optional hook to gracefully release any external resources (e.g. browser sessions)."""
+        pass

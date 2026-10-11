@@ -157,3 +157,8 @@ class BrowserTypeTool(Tool):
                 success=False,
                 error=f"Failed to type into target '{target or selector}': {str(e)}",
             )
+
+    async def close(self) -> None:
+        """Safely closes the underlying browser session."""
+        if self.session:
+            await self.session.close()
