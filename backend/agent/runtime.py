@@ -732,7 +732,7 @@ class AgentRuntime:
             # Check if task completion proposed by planner
             if next_decision.is_complete:
                 logger.info(f"[PLAN] Completion proposed: {next_decision.completion_summary}")
-                task.metadata["completion_summary"] = next_decision.completion_summary
+                proposed_summary = next_decision.completion_summary
                 self.set_state(AgentState.VERIFYING)
 
                 # Independent Verification against source of truth
@@ -768,11 +768,13 @@ class AgentRuntime:
                             self.set_state(AgentState.ADAPTING)
                             task.status = TaskStatus.FAILED
                             task.metadata["error"] = verification_result.details
+                            task.metadata.pop("completion_summary", None)
                             self.set_state(AgentState.FAILED, status=TaskStatus.FAILED)
                             return task
                         elif policy == "CORRECT_DATA":
                             logger.info("[ADAPT] Recovering from verification failure by correcting data...")
                             self.set_state(AgentState.ADAPTING)
+                            task.metadata.pop("completion_summary", None)
                             obs = Observation(
                                 action_id="verifier",
                                 success=False,
@@ -787,6 +789,7 @@ class AgentRuntime:
 
 
                 logger.info("[COMPLETE] Task successfully verified and completed.")
+                task.metadata["completion_summary"] = proposed_summary
                 self.set_state(AgentState.COMPLETED, status=TaskStatus.COMPLETED)
                 return task
 
@@ -806,6 +809,7 @@ class AgentRuntime:
                     self.set_state(AgentState.ADAPTING)
                     task.status = TaskStatus.FAILED
                     task.metadata["error"] = err_msg
+                    task.metadata.pop("completion_summary", None)
                     self.set_state(AgentState.FAILED, status=TaskStatus.FAILED)
                     return task
                 else:
@@ -839,6 +843,7 @@ class AgentRuntime:
                         self.set_state(AgentState.ADAPTING)
                         task.status = TaskStatus.FAILED
                         task.metadata["error"] = f"Loop detected: Repeated failed action '{next_action.tool_name}' without adaptation."
+                        task.metadata.pop("completion_summary", None)
                         self.set_state(AgentState.FAILED, status=TaskStatus.FAILED)
                         return task
 
@@ -896,6 +901,7 @@ class AgentRuntime:
                     self.set_state(AgentState.ADAPTING)
                     task.status = TaskStatus.FAILED
                     task.metadata["error"] = obs.error
+                    task.metadata.pop("completion_summary", None)
                     self.set_state(AgentState.FAILED, status=TaskStatus.FAILED)
                     return task
                 else:
@@ -912,6 +918,7 @@ class AgentRuntime:
             self.set_state(AgentState.ADAPTING)
             task.status = TaskStatus.FAILED
             task.metadata["error"] = f"Execution step budget of {self.max_dynamic_steps} steps exhausted."
+            task.metadata.pop("completion_summary", None)
             self.set_state(AgentState.FAILED, status=TaskStatus.FAILED)
             return task
 
@@ -919,6 +926,7 @@ class AgentRuntime:
         logger.error("[FAILED] Planner did not produce a valid completion decision.")
         task.status = TaskStatus.FAILED
         task.metadata["error"] = "Planner did not produce a valid completion decision."
+        task.metadata.pop("completion_summary", None)
         self.set_state(AgentState.FAILED, status=TaskStatus.FAILED)
         return task
 

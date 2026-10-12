@@ -125,8 +125,51 @@ class BrowserClickTool(Tool):
 
             await locator.click()
 
-            # Brief pause for DOM/navigation updates
-            await page.wait_for_timeout(500)
+            # Determine if this click represents a form submission or save action
+            click_intent = f"{target or ''} {text or ''} {selector or ''} {role or ''}".lower()
+            is_submit_action = any(
+                k in click_intent
+                for k in ["submit", "save", "create", "record", "finalize"]
+            )
+
+            if is_submit_action:
+                # Wait for form processing, error/success alerts, or navigation
+                try:
+                    await page.wait_for_selector(
+                        "#form-error-alert, #form-success-alert, [role='alert']",
+                        timeout=1500,
+                    )
+                except Exception:
+                    await page.wait_for_timeout(500)
+            else:
+                # Brief pause for DOM/navigation updates
+                await page.wait_for_timeout(500)
+
+            # Check if form submission produced an error alert on the page
+            error_alert = page.locator("#form-error-alert, [role='alert'].text-rose-800, [role='alert'].bg-rose-50").first
+            if await error_alert.count() > 0 and await error_alert.is_visible():
+                error_text = (await error_alert.inner_text()).strip()
+                clean_error = " ".join(error_text.split())
+                return Observation(
+                    action_id=action_id,
+                    success=False,
+                    error=f"Form submission failed: {clean_error}",
+                    result={
+                        "action": "clicked",
+                        "strategy": strategy,
+                        "url": page.url,
+                        "title": await page.title(),
+                        "form_error": clean_error,
+                    },
+                )
+
+            # If a success alert appeared, wait for router navigation if redirecting away from creation form
+            success_alert = page.locator("#form-success-alert").first
+            if await success_alert.count() > 0 and await success_alert.is_visible():
+                try:
+                    await page.wait_for_url(lambda u: "/new" not in u, timeout=2500)
+                except Exception:
+                    await page.wait_for_timeout(500)
 
             current_url = page.url
             title = await page.title()

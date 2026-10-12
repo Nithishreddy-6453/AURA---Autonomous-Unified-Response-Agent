@@ -73,8 +73,12 @@ DEFAULT_FINANCE_GUIDELINES: List[str] = [
     "When choosing which invoice file is latest, compare dates and filenames returned in observations.",
     "Use the exact extracted invoice ID, date, amount, due date from read_company_file or document_extract observations.",
     "For browser navigation, use the allowed portal URL (e.g. 'http://localhost:3000/finance/invoices/new').",
+    "When evaluating browser navigation, verify the target URL, HTTP status code, and actual visible page heading/content rather than treating a generic framework title alone (such as 'Create Next App') as a navigation failure. Do not request human intervention due to a default title if the URL and page content correspond to the intended portal.",
+    "For read-only portal record inspection, if the navigation observation does not provide all required fields, use browser_read to extract the complete visible invoice details before proposing completion.",
+    "When creating or entering an invoice into the Finance Portal, all 5 required fields MUST be typed before saving: 'invoice_id', 'company', 'invoice_date', 'amount', and 'due_date'. Even if the user goal specifically asks to enter the amount, all 5 fields are required to successfully record and persist the invoice in the portal.",
     "For browser typing, use valid targets like 'invoice_id', 'company', 'amount', 'due_date', 'invoice_date', etc.",
-    "For submitting, click the submit button (e.g. text='Save Invoice' or selector='#submit-invoice-button').",
+    "For submitting, click the submit button (e.g. text='Save Invoice' or selector='#submit-invoice-button') and wait for the save confirmation.",
+    "Verify that the invoice was successfully saved without validation errors and persisted in the portal before declaring task completion.",
     "Take a screenshot as evidence before marking completion.",
 ]
 

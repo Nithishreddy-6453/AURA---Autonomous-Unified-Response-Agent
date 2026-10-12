@@ -10,7 +10,15 @@ class FailureType(Enum):
 
 def classify_failure(error_msg: str, tool_name: str) -> FailureType:
     error_msg = error_msg.lower()
-    if "validation" in error_msg or "data mismatch" in error_msg or "incorrect" in error_msg or "verification failed" in error_msg:
+    if (
+        "validation" in error_msg
+        or "data mismatch" in error_msg
+        or "incorrect" in error_msg
+        or "verification failed" in error_msg
+        or "form submission failed" in error_msg
+        or "is required" in error_msg
+        or "required field" in error_msg
+    ):
         return FailureType.VALIDATION
     if "duplicate" in error_msg or "already exists" in error_msg:
         return FailureType.DUPLICATE

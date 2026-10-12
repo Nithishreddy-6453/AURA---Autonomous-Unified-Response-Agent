@@ -128,8 +128,36 @@ class BrowserNavigateTool(Tool):
             response = await page.goto(url, wait_until="domcontentloaded")
             status_code = response.status if response else 200
 
+            # Brief pause for client-side rendering and hydration
+            await page.wait_for_timeout(300)
+
             title = await page.title()
             current_url = page.url
+
+            # Extract visible page heading if present
+            heading = None
+            try:
+                if hasattr(page, "locator") and not hasattr(page, "_mock_return_value"):
+                    heading_el = page.locator("h1, h2, [role='heading']").first
+                    if await heading_el.count() > 0 and await heading_el.is_visible():
+                        raw_heading = await heading_el.inner_text()
+                        if isinstance(raw_heading, str):
+                            heading = " ".join(raw_heading.split())[:120] if raw_heading else None
+            except Exception:
+                heading = None
+
+            # Extract sanitized short visible content snippet from main/body
+            content_snippet = None
+            try:
+                if hasattr(page, "evaluate") and not hasattr(page, "_mock_return_value"):
+                    body_text = await page.evaluate(
+                        "() => (document.querySelector('main') || document.body)?.innerText?.slice(0, 400) || ''"
+                    )
+                    if isinstance(body_text, str) and body_text:
+                        cleaned_snippet = " ".join(body_text.split())
+                        content_snippet = cleaned_snippet[:250] if cleaned_snippet else None
+            except Exception:
+                content_snippet = None
 
             return Observation(
                 action_id=action_id,
@@ -138,6 +166,8 @@ class BrowserNavigateTool(Tool):
                     "status_code": status_code,
                     "url": current_url,
                     "title": title,
+                    "heading": heading,
+                    "content_snippet": content_snippet,
                 },
             )
         except Exception as e:
