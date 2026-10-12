@@ -63,7 +63,7 @@ export default function HRDashboardPage() {
       </div>
 
       <div className="bg-slate-900 border border-slate-800 rounded-lg overflow-hidden shadow-sm">
-        <table className="w-full text-left text-sm text-slate-300">
+        <table id="employee-table" className="w-full text-left text-sm text-slate-300">
           <thead className="bg-slate-950/80 text-xs text-slate-400 uppercase tracking-wider border-b border-slate-800">
             <tr>
               <th className="px-6 py-3 font-semibold">Employee ID</th>
@@ -89,7 +89,7 @@ export default function HRDashboardPage() {
               </tr>
             ) : (
               records.map((r) => (
-                <tr key={r.employee_id} className="hover:bg-slate-800/30 transition-colors">
+                <tr key={r.employee_id} data-employee-id={r.employee_id} className="hover:bg-slate-800/30 transition-colors">
                   <td className="px-6 py-4 font-mono font-medium text-indigo-400">
                     {r.employee_id}
                   </td>

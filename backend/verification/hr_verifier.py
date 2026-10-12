@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional, Union
 
 import httpx
 
+from backend.agent.domains import is_hr_read_only_task
 from backend.models.task import Task
 from backend.verification.verifier import BaseVerifier, VerificationResult
 
@@ -104,6 +105,7 @@ class HROnboardingVerifier(BaseVerifier):
         data_dir: Optional[Union[str, Path]] = None,
     ) -> None:
         self.base_url = base_url
+        self._current_task: Optional[Task] = None
         if data_dir:
             self.data_dir = Path(data_dir).resolve()
         else:
@@ -119,6 +121,7 @@ class HROnboardingVerifier(BaseVerifier):
         """
         if not task:
             return False
+        self._current_task = task
         meta = task.metadata if isinstance(task.metadata, dict) else {}
         domain = meta.get("domain")
         if domain:
@@ -126,6 +129,44 @@ class HROnboardingVerifier(BaseVerifier):
 
         goal = (task.user_goal or "").lower()
         return "hr" in goal and "onboarding" in goal
+
+    def _is_read_only_intent(
+        self,
+        task_metadata: Dict[str, Any],
+        source_reference: Optional[Union[str, Path, Dict[str, Any]]] = None,
+    ) -> bool:
+        """Determines if the task intent is strictly read-only inspection."""
+        # 1. Explicit metadata boolean flags
+        if task_metadata.get("read_only") is True:
+            return True
+        if task_metadata.get("mutation") is False:
+            return True
+        if task_metadata.get("read_only") is False:
+            return False
+        if task_metadata.get("mutation") is True:
+            return False
+
+        # 2. Explicit intent / mode / action_type strings
+        for field in ("intent", "mode", "action_type", "task_type"):
+            val = str(task_metadata.get(field, "")).strip().lower()
+            if val in ("read_only", "inspect", "inspection", "view", "query", "audit"):
+                return True
+            if val in ("mutation", "create", "finalize", "submit", "update", "onboard"):
+                return False
+
+        # 3. Source reference dict if present
+        if isinstance(source_reference, dict):
+            if source_reference.get("read_only") is True:
+                return True
+            if source_reference.get("read_only") is False:
+                return False
+
+        # 4. Attached task context if available
+        if getattr(self, "_current_task", None) is not None:
+            return is_hr_read_only_task(self._current_task)
+
+        # 5. Fallback to task_metadata / user_goal inspection
+        return is_hr_read_only_task(task_metadata)
 
     def parse_source_document(self, file_path: Union[str, Path]) -> Dict[str, Any]:
         """Independently extracts authoritative fields from a source onboarding document."""
@@ -167,16 +208,27 @@ class HROnboardingVerifier(BaseVerifier):
                 logger.warning(f"[VERIFY-HR] Failed to parse source document '{candidate_path}': {e}")
                 return None
 
-        # Fallback: scan onboarding directory
+        # Fallback: scan onboarding directory, prioritizing matching employee_id
+        target_emp_id = (
+            task_metadata.get("employee_id")
+            or task_metadata.get("emp_id")
+            or task_metadata.get("target_id")
+        )
+
         onb_dir = self.data_dir / "onboarding" if (self.data_dir / "onboarding").exists() else self.data_dir
         if onb_dir.exists():
             for f in sorted(onb_dir.glob("*.txt"), reverse=True):
                 try:
                     parsed = self.parse_source_document(f)
-                    if parsed.get("employee_id"):
+                    if target_emp_id and str(parsed.get("employee_id", "")).strip().upper() == str(target_emp_id).strip().upper():
+                        return parsed
+                    elif not target_emp_id and parsed.get("employee_id"):
                         return parsed
                 except Exception:
                     continue
+
+        if target_emp_id:
+            return {"employee_id": str(target_emp_id).strip()}
 
         return None
 
@@ -221,28 +273,56 @@ class HROnboardingVerifier(BaseVerifier):
                 expected=source_truth,
             )
 
+        is_read_only = self._is_read_only_intent(task_metadata, source_reference)
+
         # Authoritative field comparison
         mismatches: List[str] = []
         for key in ["name", "department", "start_date"]:
-            if key in source_truth:
+            if key in source_truth and source_truth[key]:
                 expected_val = str(source_truth[key]).strip().lower()
                 actual_val = str(actual_data.get(key, "")).strip().lower()
                 if expected_val != actual_val:
                     mismatches.append(f"{key}: expected '{source_truth[key]}', got '{actual_data.get(key)}'")
 
-        # Status must be COMPLETED
         actual_status = str(actual_data.get("status", "")).strip().upper()
-        if actual_status != "COMPLETED":
-            mismatches.append(f"status: expected 'COMPLETED', got '{actual_status}'")
+        if not is_read_only:
+            # Genuine onboarding mutation tasks require COMPLETED
+            if actual_status != "COMPLETED":
+                mismatches.append(f"status: expected 'COMPLETED', got '{actual_status}'")
+        else:
+            # Read-only inspection tasks do NOT require status == "COMPLETED"
+            reported_status = (
+                task_metadata.get("reported_status")
+                or task_metadata.get("observed_status")
+            )
+            if reported_status and str(reported_status).strip().upper() != actual_status:
+                mismatches.append(f"status: reported '{reported_status}', but live portal has '{actual_status}'")
 
-        # Required checklist items check
-        expected_checklist = source_truth.get("checklist")
-        if expected_checklist and isinstance(expected_checklist, list):
-            actual_checklist = actual_data.get("checklist", [])
-            if not isinstance(actual_checklist, list):
-                mismatches.append(f"checklist: expected list, got {type(actual_checklist).__name__}")
-            else:
-                actual_checklist_norm = [str(item).strip().lower() for item in actual_checklist]
+        actual_checklist = actual_data.get("checklist", [])
+        if not isinstance(actual_checklist, list):
+            mismatches.append(f"checklist: expected list in live portal, got {type(actual_checklist).__name__}")
+            actual_checklist_norm = []
+        else:
+            actual_checklist_norm = [str(item).strip().lower() for item in actual_checklist]
+
+        if is_read_only:
+            # Read-only tasks: verify that reported checklist data matches observed live state
+            reported_checklist = (
+                task_metadata.get("reported_checklist")
+                or task_metadata.get("observed_checklist")
+            )
+            if reported_checklist and isinstance(reported_checklist, list):
+                for item in reported_checklist:
+                    if str(item).strip().lower() not in actual_checklist_norm:
+                        mismatches.append(f"reported checklist item '{item}' not found in live portal checklist")
+            elif source_truth.get("checklist") and isinstance(source_truth.get("checklist"), list):
+                for item in source_truth["checklist"]:
+                    if str(item).strip().lower() not in actual_checklist_norm:
+                        mismatches.append(f"live checklist missing expected item: '{item}'")
+        else:
+            # Strict checklist verification for genuine onboarding mutation tasks
+            expected_checklist = source_truth.get("checklist")
+            if expected_checklist and isinstance(expected_checklist, list):
                 for item in expected_checklist:
                     if str(item).strip().lower() not in actual_checklist_norm:
                         mismatches.append(f"checklist missing item: '{item}'")
@@ -257,7 +337,8 @@ class HROnboardingVerifier(BaseVerifier):
                 actual=actual_data,
             )
 
-        logger.info(f"[VERIFY-HR] Employee '{employee_id}' successfully verified.")
+        intent_label = "read_only" if is_read_only else "mutation"
+        logger.info(f"[VERIFY-HR] Employee '{employee_id}' successfully verified (intent={intent_label}).")
         return VerificationResult(
             True,
             f"Onboarding record '{employee_id}' successfully verified against independent source truth.",

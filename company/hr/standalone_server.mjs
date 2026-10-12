@@ -12,10 +12,10 @@ const SEED_ONBOARDINGS = [
     start_date: "2026-04-01",
     role: "Platform Engineer",
     checklist: ["Security Background Check", "Laptop Provisioning", "System Access"],
-    status: "PENDING",
+    status: "COMPLETED",
     notes: "Awaiting hardware provisioning and system setup.",
     created_at: "2026-03-25T08:00:00Z",
-    updated_at: "2026-03-25T08:00:00Z",
+    updated_at: "2026-10-12T12:55:25.029Z",
   },
   {
     employee_id: "EMP-091",
@@ -66,7 +66,7 @@ resetStore();
 
 function renderDashboardHtml(records) {
   const rows = records.map(r => `
-    <tr style="border-bottom: 1px solid #1e293b;">
+    <tr data-employee-id="${r.employee_id}" style="border-bottom: 1px solid #1e293b;">
       <td style="padding: 12px 16px; font-family: monospace; color: #818cf8;">${r.employee_id}</td>
       <td style="padding: 12px 16px; font-weight: bold; color: #fff;">${r.name}</td>
       <td style="padding: 12px 16px; color: #cbd5e1;">${r.department}</td>
@@ -103,7 +103,7 @@ function renderDashboardHtml(records) {
       </div>
       <a href="/hr/onboarding/new" id="new-onboarding-link" class="btn">+ New Onboarding Request</a>
     </div>
-    <table>
+    <table id="employee-table">
       <thead>
         <tr>
           <th>Employee ID</th>
